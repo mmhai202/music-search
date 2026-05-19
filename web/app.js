@@ -1,5 +1,9 @@
 const listenButton = document.querySelector("#listenButton");
 const buttonText = document.querySelector("#buttonText");
+const audioFile = document.querySelector("#audioFile");
+const fileName = document.querySelector("#fileName");
+const uploadButton = document.querySelector("#uploadButton");
+const uploadButtonText = document.querySelector("#uploadButtonText");
 const resultEl = document.querySelector("#result");
 const historyEl = document.querySelector("#history");
 const clearButton = document.querySelector("#clearButton");
@@ -15,10 +19,21 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function userErrorMessage(error) {
+  const message = String(error || "");
+  if (message.toLowerCase().includes("does not contain any stream")) {
+    return "Không tìm thấy audio trong file.";
+  }
+  return message;
+}
+
 function setBusy(isBusy) {
   listenButton.disabled = isBusy;
+  uploadButton.disabled = isBusy;
+  audioFile.disabled = isBusy;
   listenButton.classList.toggle("is-listening", isBusy);
   buttonText.textContent = isBusy ? "Đang nghe..." : "Tìm bài đang phát";
+  uploadButtonText.textContent = isBusy ? "Đang tìm..." : "Tìm kiếm";
 }
 
 function trackText(item) {
@@ -85,7 +100,7 @@ async function copyTrack(item, button) {
 
 function renderResult(data) {
   if (!data.ok) {
-    resultEl.innerHTML = `<p class="muted">${escapeHtml(data.error || "Co loi roi")}</p>`;
+    resultEl.innerHTML = `<p class="muted">${escapeHtml(userErrorMessage(data.error) || "Co loi roi")}</p>`;
     return;
   }
 
@@ -213,7 +228,41 @@ async function recognize() {
   }
 }
 
+async function recognizeFile() {
+  const file = audioFile.files?.[0];
+  if (!file) {
+    resultEl.innerHTML = `<p class="muted">Chọn một file audio trước khi nhận diện.</p>`;
+    return;
+  }
+
+  setBusy(true);
+  resultEl.innerHTML = `<p class="muted">Đang tải và nhận diện ${escapeHtml(file.name)}...</p>`;
+
+  try {
+    const response = await fetch("/api/recognize-file", {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "X-Filename": encodeURIComponent(file.name),
+      },
+      body: file,
+    });
+    const data = await response.json();
+    renderResult(data);
+    await loadHistory();
+  } catch (error) {
+    renderResult({ ok: false, error: error.message });
+  } finally {
+    setBusy(false);
+  }
+}
+
 listenButton.addEventListener("click", recognize);
+uploadButton.addEventListener("click", recognizeFile);
+audioFile.addEventListener("change", () => {
+  const file = audioFile.files?.[0];
+  fileName.textContent = file ? file.name : "Chọn file để tìm";
+});
 clearButton.addEventListener("click", clearHistory);
 historyEl.addEventListener("click", async (event) => {
   const button = event.target.closest("button");

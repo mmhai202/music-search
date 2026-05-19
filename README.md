@@ -1,14 +1,15 @@
 # Music Search
 
-Ứng dụng web để nhận diện bài nhạc đang phát trên máy.
+Ứng dụng web để nhận diện bài nhạc đang phát trên máy hoặc từ file audio upload.
 
-Dự án dùng `ffmpeg` để thu âm thanh hệ thống, dùng `vibra` để nhận diện bài hát, rồi hiển thị kết quả trên giao diện web.
+Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audio, dùng `vibra` để nhận diện bài hát, rồi hiển thị kết quả trên giao diện web.
 
 ![Giao diện Music Search](scripts/image.png)
 
 ## Tính năng
 
 - Nhận diện bài hát đang phát trên máy.
+- Nhận diện bài hát từ file audio upload.
 - Có link mở kết quả trên Shazam.
 - Lưu lịch sử 10 bài gần nhất.
 
@@ -52,4 +53,4 @@ Sau đó mở trình duyệt:
 http://127.0.0.1:8765
 ```
 
-bấm nút **Tìm bài đang phát**, chờ vài giây để ứng dụng nhận diện.
+bấm nút **Tìm bài đang phát** để nghe audio hệ thống, hoặc chọn file audio rồi bấm **Nhận diện file audio**.

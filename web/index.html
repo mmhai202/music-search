@@ -20,8 +20,32 @@
           <span id="buttonText">Tìm bài đang phát</span>
         </button>
 
+        <div class="upload-box">
+          <input class="visually-hidden" id="audioFile" type="file" accept="audio/*">
+          <label class="file-picker" for="audioFile">
+            <span class="file-icon" aria-hidden="true">
+              <svg class="folder-icon" viewBox="0 0 24 24" focusable="false">
+                <path class="folder-tab" d="M3.7 7.2c0-1 .8-1.8 1.8-1.8h4.2c.5 0 1 .2 1.3.6l1.3 1.5h6.2c1 0 1.8.8 1.8 1.8v1.5H3.7V7.2Z"/>
+                <path class="folder-body" d="M3.7 9.4h16.6v7.7c0 1.1-.9 2-2 2H5.7c-1.1 0-2-.9-2-2V9.4Z"/>
+                <path class="folder-shine" d="M7.1 12.1h8.4"/>
+              </svg>
+            </span>
+            <span class="file-text">
+              <span class="file-kicker">File audio</span>
+              <span class="file-name" id="fileName">Chọn file để tìm</span>
+              <span class="file-hint">MP3, WAV, M4A, MP4, FLAC, OGG, WEBM</span>
+            </span>
+          </label>
+          <button class="upload-button" id="uploadButton" type="button">
+            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="m20.4 18.9-4.2-4.2a7.2 7.2 0 1 0-1.5 1.5l4.2 4.2a1.1 1.1 0 0 0 1.5-1.5ZM5.1 10.7a5.6 5.6 0 1 1 5.6 5.6 5.6 5.6 0 0 1-5.6-5.6Z"/>
+            </svg>
+            <span id="uploadButtonText">Tìm kiếm</span>
+          </button>
+        </div>
+
         <div class="result" id="result">
-          <p class="muted">Bấm nút rồi để nhạc chạy khoảng vài giây.</p>
+          <p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>
         </div>
       </section>
 

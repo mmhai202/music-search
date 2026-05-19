@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import hashlib
 import json
+import math
 import os
 import subprocess
 import threading
@@ -20,6 +21,7 @@ ATTEMPT_MARKS = (3, 5, 8, 10)
 RATE = 44100
 CHANNELS = 1
 BITS = 32
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 recognize_lock = threading.Lock()
 
@@ -40,6 +42,14 @@ def normalize_history_item(item):
 
 def run_text(args):
     return subprocess.run(args, text=True, capture_output=True, check=False)
+
+
+def user_error_message(error):
+    message = str(error)
+    lowered = message.lower()
+    if "does not contain any stream" in lowered:
+        return "Không tìm thấy audio trong file."
+    return message
 
 
 def parse_sinks(pactl_output):
@@ -119,6 +129,33 @@ def capture_audio(device, seconds):
     return proc.stdout
 
 
+def decode_audio_file(audio_bytes, seconds):
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-t",
+        str(seconds),
+        "-ac",
+        str(CHANNELS),
+        "-ar",
+        str(RATE),
+        "-f",
+        "s32le",
+        "-",
+    ]
+    proc = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=False)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        if "does not contain any stream" in err.lower():
+            raise RuntimeError("Không tìm thấy audio trong file.")
+        raise RuntimeError(err or "ffmpeg khong doc duoc file audio")
+    return proc.stdout
+
+
 def recognize_pcm(pcm, seconds):
     cmd = [
         "vibra",
@@ -144,6 +181,34 @@ def recognize_pcm(pcm, seconds):
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"vibra returned invalid JSON: {exc}") from exc
+
+
+def result_from_track(track, started, seconds, source, filename=""):
+    title = track.get("title") or ""
+    artist = track.get("subtitle") or ""
+    href = ((track.get("share") or {}).get("href") or "")
+    cover_url = first_image_url(track)
+
+    if not title:
+        return None
+
+    result = {
+        "ok": True,
+        "found": True,
+        "id": "",
+        "title": title,
+        "artist": artist,
+        "href": href,
+        "cover_url": cover_url,
+        "source": source,
+        "seconds": seconds,
+        "elapsed": round(time.time() - started, 2),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if filename:
+        result["filename"] = filename
+    result["id"] = history_id(result)
+    return result
 
 
 def write_history(items):
@@ -219,26 +284,10 @@ def recognize_track():
 
             data = recognize_pcm(pcm, mark)
             track = data.get("track") or {}
-            title = track.get("title") or ""
-            artist = track.get("subtitle") or ""
-            href = ((track.get("share") or {}).get("href") or "")
-            cover_url = first_image_url(track)
+            result = result_from_track(track, started, mark, "system")
 
-            if title:
-                result = {
-                    "ok": True,
-                    "found": True,
-                    "id": "",
-                    "title": title,
-                    "artist": artist,
-                    "href": href,
-                    "cover_url": cover_url,
-                    "device": device,
-                    "seconds": mark,
-                    "elapsed": round(time.time() - started, 2),
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                result["id"] = history_id(result)
+            if result:
+                result["device"] = device
                 save_history(result)
                 return result
 
@@ -250,6 +299,46 @@ def recognize_track():
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         return result
+    finally:
+        recognize_lock.release()
+
+
+def recognize_uploaded_file(audio_bytes, filename=""):
+    if not recognize_lock.acquire(blocking=False):
+        raise RuntimeError("Dang nhan dien roi")
+
+    try:
+        started = time.time()
+        pcm = decode_audio_file(audio_bytes, ATTEMPT_MARKS[-1])
+        bytes_per_second = RATE * CHANNELS * (BITS // 8)
+        if not pcm:
+            raise RuntimeError("File audio khong co du lieu am thanh doc duoc")
+
+        for mark in ATTEMPT_MARKS:
+            sample_size = min(len(pcm), mark * bytes_per_second)
+            if sample_size <= 0:
+                continue
+
+            sample_seconds = max(1, math.ceil(sample_size / bytes_per_second))
+            data = recognize_pcm(pcm[:sample_size], sample_seconds)
+            track = data.get("track") or {}
+            result = result_from_track(track, started, sample_seconds, "upload", filename)
+
+            if result:
+                save_history(result)
+                return result
+
+            if sample_size == len(pcm):
+                break
+
+        return {
+            "ok": True,
+            "found": False,
+            "source": "upload",
+            "filename": filename,
+            "elapsed": round(time.time() - started, 2),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
     finally:
         recognize_lock.release()
 
@@ -324,6 +413,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "items": load_history()})
             return
 
+        if parsed.path == "/api/recognize-file":
+            content_length = int(self.headers.get("Content-Length") or "0")
+            if content_length <= 0:
+                self.send_json(400, {"ok": False, "error": "Missing audio file"})
+                return
+            if content_length > MAX_UPLOAD_BYTES:
+                self.send_json(413, {"ok": False, "error": "File audio qua lon, toi da 50MB"})
+                return
+
+            filename = urllib.parse.unquote(self.headers.get("X-Filename", "")).strip()
+            audio_bytes = self.rfile.read(content_length)
+            try:
+                self.send_json(200, recognize_uploaded_file(audio_bytes, filename))
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": user_error_message(exc)})
+            return
+
         if parsed.path != "/api/recognize":
             self.send_error(404)
             return
@@ -331,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_json(200, recognize_track())
         except Exception as exc:
-            self.send_json(500, {"ok": False, "error": str(exc)})
+            self.send_json(500, {"ok": False, "error": user_error_message(exc)})
 
 
 def main():
