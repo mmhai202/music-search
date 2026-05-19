@@ -4,11 +4,33 @@ const audioFile = document.querySelector("#audioFile");
 const fileName = document.querySelector("#fileName");
 const uploadButton = document.querySelector("#uploadButton");
 const uploadButtonText = document.querySelector("#uploadButtonText");
+const filePreview = document.querySelector("#filePreview");
+const previewAudio = document.querySelector("#previewAudio");
+const previewPlay = document.querySelector("#previewPlay");
+const previewPlayIcon = document.querySelector("#previewPlayIcon");
+const previewPlayText = document.querySelector("#previewPlayText");
+const previewReset = document.querySelector("#previewReset");
+const previewRangeText = document.querySelector("#previewRangeText");
+const waveformBox = document.querySelector("#waveformBox");
+const waveformCanvas = document.querySelector("#waveformCanvas");
 const resultEl = document.querySelector("#result");
 const historyEl = document.querySelector("#history");
 const clearButton = document.querySelector("#clearButton");
 
+const PREVIEW_SECONDS = 10;
+const MIN_SELECTION_SECONDS = 1;
+const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
+const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";
+const STOP_ICON_PATH = "M7.2 6.2c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2H8.4c-.7 0-1.2-.5-1.2-1.2V6.2Zm5.4 0c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2h-1.8c-.7 0-1.2-.5-1.2-1.2V6.2Z";
+
 let historyItems = [];
+let previewUrl = "";
+let previewDuration = 0;
+let selectionStart = 0;
+let selectionEnd = PREVIEW_SECONDS;
+let waveformPeaks = [];
+let activeWaveformDrag = "";
+let playbackFrame = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -31,9 +53,248 @@ function setBusy(isBusy) {
   listenButton.disabled = isBusy;
   uploadButton.disabled = isBusy;
   audioFile.disabled = isBusy;
+  previewPlay.disabled = isBusy || !audioFile.files?.[0];
+  previewReset.disabled = isBusy;
+  waveformBox.classList.toggle("is-disabled", isBusy || !audioFile.files?.[0]);
   listenButton.classList.toggle("is-listening", isBusy);
   buttonText.textContent = isBusy ? "Đang nghe..." : "Tìm bài đang phát";
   uploadButtonText.textContent = isBusy ? "Đang tìm..." : "Tìm kiếm";
+}
+
+function formatTime(value) {
+  const total = Math.max(0, Math.floor(Number(value) || 0));
+  const minutes = String(Math.floor(total / 60)).padStart(2, "0");
+  const seconds = String(total % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function selectedStartSeconds() {
+  return Math.max(0, selectionStart);
+}
+
+function selectedEndSeconds() {
+  return Math.max(selectedStartSeconds() + MIN_SELECTION_SECONDS, selectionEnd);
+}
+
+function updatePreviewRangeText() {
+  previewRangeText.textContent = `${formatTime(selectedStartSeconds())} - ${formatTime(selectedEndSeconds())}`;
+}
+
+function stopPreview() {
+  previewAudio.pause();
+  if (playbackFrame) {
+    cancelAnimationFrame(playbackFrame);
+    playbackFrame = 0;
+  }
+  previewPlayText.textContent = "Nghe thử";
+  previewPlayIcon.setAttribute("d", PLAY_ICON_PATH);
+  drawWaveform();
+}
+
+function animatePlayback() {
+  if (!previewAudio.paused && previewAudio.currentTime >= selectedEndSeconds()) {
+    previewAudio.currentTime = selectedEndSeconds();
+    stopPreview();
+    return;
+  }
+  drawWaveform();
+  if (!previewAudio.paused) {
+    playbackFrame = requestAnimationFrame(animatePlayback);
+  }
+}
+
+function resetPreview() {
+  stopPreview();
+  if (previewUrl) {
+    URL.revokeObjectURL(previewUrl);
+    previewUrl = "";
+  }
+  previewAudio.removeAttribute("src");
+  previewAudio.load();
+  previewPlay.disabled = true;
+  previewDuration = 0;
+  selectionStart = 0;
+  selectionEnd = PREVIEW_SECONDS;
+  waveformPeaks = [];
+  updatePreviewRangeText();
+  drawWaveform();
+  filePreview.classList.add("is-hidden");
+}
+
+function resetSelectedFile() {
+  audioFile.value = "";
+  fileName.textContent = "Chọn file để tìm";
+  resultEl.innerHTML = INITIAL_RESULT_HTML;
+  previewReset.classList.add("is-hidden");
+  resetPreview();
+}
+
+function loadFilePreview(file) {
+  resetPreview();
+  if (!file) {
+    return;
+  }
+
+  previewUrl = URL.createObjectURL(file);
+  previewAudio.src = previewUrl;
+  filePreview.classList.remove("is-hidden");
+  previewReset.classList.remove("is-hidden");
+  previewPlay.disabled = false;
+  updatePreviewRangeText();
+  drawWaveform();
+  analyzeWaveform(file);
+}
+
+function clampSelection() {
+  const duration = Math.max(MIN_SELECTION_SECONDS, previewDuration || PREVIEW_SECONDS);
+  selectionStart = Math.max(0, Math.min(selectionStart, duration - MIN_SELECTION_SECONDS));
+  selectionEnd = Math.max(selectionStart + MIN_SELECTION_SECONDS, Math.min(selectionEnd, duration));
+}
+
+function clampPlayhead() {
+  if (previewAudio.currentTime < selectionStart) {
+    previewAudio.currentTime = selectionStart;
+  } else if (previewAudio.currentTime > selectionEnd) {
+    previewAudio.currentTime = selectionEnd;
+  }
+}
+
+function clampedPlayheadTime() {
+  return Math.max(selectionStart, Math.min(previewAudio.currentTime, selectionEnd));
+}
+
+function canvasPointToSeconds(event) {
+  const rect = waveformCanvas.getBoundingClientRect();
+  if (!rect.width) {
+    return 0;
+  }
+  const x = Math.max(0, Math.min(event.clientX - rect.left, rect.width));
+  const duration = previewDuration || PREVIEW_SECONDS;
+  return (x / rect.width) * duration;
+}
+
+function setSelectionFromPointer(event) {
+  const seconds = canvasPointToSeconds(event);
+  if (activeWaveformDrag === "start") {
+    selectionStart = Math.min(seconds, selectionEnd - MIN_SELECTION_SECONDS);
+  } else if (activeWaveformDrag === "end") {
+    selectionEnd = Math.max(seconds, selectionStart + MIN_SELECTION_SECONDS);
+  } else if (activeWaveformDrag === "move") {
+    const width = selectionEnd - selectionStart;
+    selectionStart = seconds - width / 2;
+    selectionEnd = selectionStart + width;
+  } else if (activeWaveformDrag === "playhead") {
+    previewAudio.currentTime = Math.max(selectionStart, Math.min(seconds, selectionEnd));
+  }
+  clampSelection();
+  stopPreview();
+  clampPlayhead();
+  updatePreviewRangeText();
+  drawWaveform();
+}
+
+function drawWaveform() {
+  const rect = waveformBox.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width || 1));
+  const height = 92;
+  const ratio = window.devicePixelRatio || 1;
+  waveformCanvas.width = Math.floor(width * ratio);
+  waveformCanvas.height = Math.floor(height * ratio);
+  waveformCanvas.style.width = `${width}px`;
+  waveformCanvas.style.height = `${height}px`;
+
+  const ctx = waveformCanvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#fffafd";
+  ctx.fillRect(0, 0, width, height);
+
+  const center = height / 2;
+  const barGap = 2;
+  const barWidth = 2;
+  const barCount = Math.max(1, Math.floor(width / (barWidth + barGap)));
+  const peaks = waveformPeaks.length ? waveformPeaks : Array.from({ length: barCount }, (_, index) => {
+    return 0.28 + Math.abs(Math.sin(index * 0.37)) * 0.45;
+  });
+
+  ctx.strokeStyle = "rgba(234, 219, 230, 0.95)";
+  ctx.beginPath();
+  ctx.moveTo(0, center);
+  ctx.lineTo(width, center);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(89, 79, 86, 0.58)";
+  for (let index = 0; index < barCount; index += 1) {
+    const peakIndex = Math.floor((index / barCount) * peaks.length);
+    const peak = Math.max(0.08, peaks[peakIndex] || 0.08);
+    const barHeight = Math.max(6, peak * (height - 16));
+    const x = index * (barWidth + barGap) + 4;
+    ctx.fillRect(x, center - barHeight / 2, barWidth, barHeight);
+  }
+
+  const duration = previewDuration || PREVIEW_SECONDS;
+  const startX = (selectionStart / duration) * width;
+  const endX = (selectionEnd / duration) * width;
+
+  ctx.fillStyle = "rgba(255, 95, 158, 0.16)";
+  ctx.fillRect(startX, 0, Math.max(2, endX - startX), height);
+
+  ctx.fillStyle = "#ff5f9e";
+  ctx.fillRect(startX - 2, 0, 4, height);
+  ctx.fillRect(endX - 2, 0, 4, height);
+
+  if (previewAudio.src) {
+    const displayTime = clampedPlayheadTime();
+    const currentX = (displayTime / duration) * width;
+    ctx.fillStyle = "#ffd166";
+    ctx.shadowColor = "rgba(255, 209, 102, 0.48)";
+    ctx.shadowBlur = 4;
+    ctx.fillRect(currentX - 2, 0, 4, height);
+    ctx.shadowBlur = 0;
+
+    const labelWidth = 38;
+    const labelX = Math.max(0, Math.min(width - labelWidth, currentX - labelWidth / 2));
+    ctx.fillStyle = "rgba(39, 33, 43, 0.86)";
+    ctx.fillRect(labelX, height - 22, labelWidth, 18);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+    ctx.fillText(formatTime(displayTime), labelX + 4, height - 9);
+  }
+}
+
+async function analyzeWaveform(file) {
+  try {
+    const buffer = await file.arrayBuffer();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      drawWaveform();
+      return;
+    }
+    const context = new AudioContextClass();
+    const audioBuffer = await context.decodeAudioData(buffer);
+    previewDuration = audioBuffer.duration || previewDuration;
+    selectionStart = 0;
+    selectionEnd = Math.min(PREVIEW_SECONDS, Math.max(MIN_SELECTION_SECONDS, previewDuration));
+
+    const data = audioBuffer.getChannelData(0);
+    const peakCount = 180;
+    const blockSize = Math.max(1, Math.floor(data.length / peakCount));
+    waveformPeaks = Array.from({ length: peakCount }, (_, index) => {
+      const start = index * blockSize;
+      const end = Math.min(data.length, start + blockSize);
+      let max = 0;
+      for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
+        max = Math.max(max, Math.abs(data[sampleIndex]));
+      }
+      return max;
+    });
+    await context.close?.();
+    clampSelection();
+    updatePreviewRangeText();
+    drawWaveform();
+  } catch (error) {
+    drawWaveform();
+  }
 }
 
 function trackText(item) {
@@ -214,6 +475,7 @@ async function deleteHistoryItem(id) {
 
 async function recognize() {
   setBusy(true);
+  previewReset.classList.remove("is-hidden");
   resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy...</p>`;
 
   try {
@@ -236,7 +498,10 @@ async function recognizeFile() {
   }
 
   setBusy(true);
-  resultEl.innerHTML = `<p class="muted">Đang tải và nhận diện ${escapeHtml(file.name)}...</p>`;
+  previewReset.classList.remove("is-hidden");
+  const startSeconds = selectedStartSeconds();
+  const endSeconds = selectedEndSeconds();
+  resultEl.innerHTML = `<p class="muted">Đang tìm trong khoảng ${escapeHtml(formatTime(startSeconds))} - ${escapeHtml(formatTime(endSeconds))} của ${escapeHtml(file.name)}...</p>`;
 
   try {
     const response = await fetch("/api/recognize-file", {
@@ -244,6 +509,8 @@ async function recognizeFile() {
       headers: {
         "Content-Type": file.type || "application/octet-stream",
         "X-Filename": encodeURIComponent(file.name),
+        "X-Start-Seconds": String(startSeconds),
+        "X-End-Seconds": String(endSeconds),
       },
       body: file,
     });
@@ -262,7 +529,90 @@ uploadButton.addEventListener("click", recognizeFile);
 audioFile.addEventListener("change", () => {
   const file = audioFile.files?.[0];
   fileName.textContent = file ? file.name : "Chọn file để tìm";
+  loadFilePreview(file);
 });
+previewAudio.addEventListener("loadedmetadata", () => {
+  const duration = Number.isFinite(previewAudio.duration) ? previewAudio.duration : 0;
+  previewDuration = duration || previewDuration;
+  selectionStart = 0;
+  selectionEnd = Math.min(PREVIEW_SECONDS, Math.max(MIN_SELECTION_SECONDS, previewDuration || PREVIEW_SECONDS));
+  clampSelection();
+  previewAudio.currentTime = selectionStart;
+  updatePreviewRangeText();
+  drawWaveform();
+});
+previewAudio.addEventListener("timeupdate", () => {
+  if (!previewAudio.paused && previewAudio.currentTime >= selectedEndSeconds()) {
+    previewAudio.currentTime = selectedEndSeconds();
+    stopPreview();
+    return;
+  }
+  drawWaveform();
+});
+previewAudio.addEventListener("ended", () => {
+  stopPreview();
+  drawWaveform();
+});
+waveformCanvas.addEventListener("pointerdown", (event) => {
+  if (!audioFile.files?.[0]) {
+    return;
+  }
+  const duration = previewDuration || PREVIEW_SECONDS;
+  const clicked = canvasPointToSeconds(event);
+  const threshold = Math.max(1, duration * 0.025);
+  if (Math.abs(clicked - clampedPlayheadTime()) <= threshold) {
+    activeWaveformDrag = "playhead";
+  } else if (Math.abs(clicked - selectionStart) <= threshold) {
+    activeWaveformDrag = "start";
+  } else if (Math.abs(clicked - selectionEnd) <= threshold) {
+    activeWaveformDrag = "end";
+  } else if (clicked > selectionStart && clicked < selectionEnd) {
+    activeWaveformDrag = "move";
+  } else {
+    const distanceToStart = Math.abs(clicked - selectionStart);
+    const distanceToEnd = Math.abs(clicked - selectionEnd);
+    activeWaveformDrag = distanceToStart < distanceToEnd ? "start" : "end";
+  }
+  waveformCanvas.setPointerCapture(event.pointerId);
+  setSelectionFromPointer(event);
+});
+waveformCanvas.addEventListener("pointermove", (event) => {
+  if (!activeWaveformDrag) {
+    return;
+  }
+  setSelectionFromPointer(event);
+});
+waveformCanvas.addEventListener("pointerup", (event) => {
+  activeWaveformDrag = "";
+  waveformCanvas.releasePointerCapture(event.pointerId);
+});
+window.addEventListener("resize", drawWaveform);
+previewPlay.addEventListener("click", async () => {
+  if (!audioFile.files?.[0]) {
+    return;
+  }
+
+  if (!previewAudio.paused) {
+    stopPreview();
+    return;
+  }
+
+  if (previewAudio.currentTime < selectedStartSeconds() || previewAudio.currentTime >= selectedEndSeconds()) {
+    previewAudio.currentTime = selectedStartSeconds();
+  }
+  previewPlayText.textContent = "Dừng";
+  previewPlayIcon.setAttribute("d", STOP_ICON_PATH);
+  try {
+    await previewAudio.play();
+    animatePlayback();
+  } catch (error) {
+    previewPlayText.textContent = "Không phát được";
+    setTimeout(() => {
+      previewPlayText.textContent = "Nghe thử";
+    }, 1200);
+  }
+});
+previewReset.addEventListener("click", resetSelectedFile);
 clearButton.addEventListener("click", clearHistory);
 historyEl.addEventListener("click", async (event) => {
   const button = event.target.closest("button");

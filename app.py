@@ -129,7 +129,7 @@ def capture_audio(device, seconds):
     return proc.stdout
 
 
-def decode_audio_file(audio_bytes, seconds):
+def decode_audio_file(audio_bytes, seconds, start_seconds=0):
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -137,6 +137,8 @@ def decode_audio_file(audio_bytes, seconds):
         "error",
         "-i",
         "pipe:0",
+        "-ss",
+        str(start_seconds),
         "-t",
         str(seconds),
         "-ac",
@@ -303,18 +305,22 @@ def recognize_track():
         recognize_lock.release()
 
 
-def recognize_uploaded_file(audio_bytes, filename=""):
+def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_seconds=0):
     if not recognize_lock.acquire(blocking=False):
         raise RuntimeError("Dang nhan dien roi")
 
     try:
         started = time.time()
-        pcm = decode_audio_file(audio_bytes, ATTEMPT_MARKS[-1])
+        requested_seconds = max(1, math.ceil((end_seconds or start_seconds + ATTEMPT_MARKS[-1]) - start_seconds))
+        pcm = decode_audio_file(audio_bytes, requested_seconds, start_seconds)
         bytes_per_second = RATE * CHANNELS * (BITS // 8)
         if not pcm:
             raise RuntimeError("File audio khong co du lieu am thanh doc duoc")
 
-        for mark in ATTEMPT_MARKS:
+        final_seconds = max(1, math.ceil(len(pcm) / bytes_per_second))
+        attempt_marks = tuple(mark for mark in ATTEMPT_MARKS if mark < final_seconds) + (final_seconds,)
+
+        for mark in attempt_marks:
             sample_size = min(len(pcm), mark * bytes_per_second)
             if sample_size <= 0:
                 continue
@@ -325,6 +331,8 @@ def recognize_uploaded_file(audio_bytes, filename=""):
             result = result_from_track(track, started, sample_seconds, "upload", filename)
 
             if result:
+                result["start_seconds"] = start_seconds
+                result["end_seconds"] = start_seconds + sample_seconds
                 save_history(result)
                 return result
 
@@ -336,6 +344,8 @@ def recognize_uploaded_file(audio_bytes, filename=""):
             "found": False,
             "source": "upload",
             "filename": filename,
+            "start_seconds": start_seconds,
+            "end_seconds": start_seconds + final_seconds,
             "elapsed": round(time.time() - started, 2),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -423,9 +433,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             filename = urllib.parse.unquote(self.headers.get("X-Filename", "")).strip()
+            try:
+                start_seconds = max(0, float(self.headers.get("X-Start-Seconds") or "0"))
+                end_seconds = max(start_seconds + 1, float(self.headers.get("X-End-Seconds") or str(start_seconds + ATTEMPT_MARKS[-1])))
+            except ValueError:
+                self.send_json(400, {"ok": False, "error": "Invalid selected range"})
+                return
+
             audio_bytes = self.rfile.read(content_length)
             try:
-                self.send_json(200, recognize_uploaded_file(audio_bytes, filename))
+                self.send_json(200, recognize_uploaded_file(audio_bytes, filename, start_seconds, end_seconds))
             except Exception as exc:
                 self.send_json(500, {"ok": False, "error": user_error_message(exc)})
             return
