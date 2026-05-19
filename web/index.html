@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Music Search</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <div class="topbar">
+          <div>
+            <h1>Music Search</h1>
+          </div>
+        </div>
+
+        <button class="listen-button" id="listenButton" type="button">
+          <span class="disc"></span>
+          <span id="buttonText">Tìm bài đang phát</span>
+        </button>
+
+        <div class="result" id="result">
+          <p class="muted">Bấm nút rồi để nhạc chạy khoảng vài giây.</p>
+        </div>
+      </section>
+
+      <section class="history-wrap">
+        <div class="history-head">
+          <h2>Lịch sử</h2>
+          <button class="ghost-button" id="clearButton" type="button">Xóa tất cả</button>
+        </div>
+        <div class="history" id="history"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
