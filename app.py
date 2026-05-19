@@ -17,13 +17,39 @@ HISTORY_FILE = ROOT / "history.jsonl"
 HISTORY_LIMIT = 10
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
-ATTEMPT_MARKS = (3, 5, 8, 10)
+SYSTEM_ATTEMPT_MARKS = (3, 6)
+DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
 CHANNELS = 1
 BITS = 32
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MIN_UPLOAD_SECONDS = 3
+ALLOWED_UPLOAD_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".flac", ".ogg", ".webm"}
+ALLOWED_UPLOAD_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/mp4",
+    "audio/m4a",
+    "audio/x-m4a",
+    "audio/flac",
+    "audio/x-flac",
+    "audio/ogg",
+    "video/mp4",
+    "video/webm",
+    "application/ogg",
+}
 
 recognize_lock = threading.Lock()
+
+
+class AppError(RuntimeError):
+    def __init__(self, message, status=400, code="bad_request"):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 def history_id(item):
@@ -47,9 +73,31 @@ def run_text(args):
 def user_error_message(error):
     message = str(error)
     lowered = message.lower()
+    if "dang nhan dien roi" in lowered:
+        return "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại."
     if "does not contain any stream" in lowered:
         return "Không tìm thấy audio trong file."
+    if "invalid data found when processing input" in lowered:
+        return "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM."
+    if "file audio khong co du lieu am thanh doc duoc" in lowered:
+        return "File không có audio đọc được."
+    if "khong co audio dang phat" in lowered:
+        return "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại."
     return message
+
+
+def validate_upload_type(filename, content_type):
+    suffix = Path(filename).suffix.lower()
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if suffix in ALLOWED_UPLOAD_EXTENSIONS:
+        return
+    if normalized_type in ALLOWED_UPLOAD_TYPES:
+        return
+    raise AppError(
+        "Chỉ hỗ trợ file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.",
+        status=415,
+        code="unsupported_upload_type",
+    )
 
 
 def parse_sinks(pactl_output):
@@ -88,6 +136,13 @@ def detect_device():
         if sink.get("state") == "RUNNING" and sink.get("monitor"):
             return sink["monitor"]
 
+    if sinks:
+        raise AppError(
+            "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại.",
+            status=409,
+            code="no_audio_playing",
+        )
+
     default = run_text(["pactl", "get-default-sink"])
     default_sink = default.stdout.strip() if default.returncode == 0 else ""
     if default_sink:
@@ -99,7 +154,11 @@ def detect_device():
         if sink.get("monitor"):
             return sink["monitor"]
 
-    raise RuntimeError("Khong tim thay PulseAudio sink monitor")
+    raise AppError(
+        "Không tìm thấy thiết bị audio để thu âm.",
+        status=503,
+        code="audio_device_not_found",
+    )
 
 
 def capture_audio(device, seconds):
@@ -153,8 +212,12 @@ def decode_audio_file(audio_bytes, seconds, start_seconds=0):
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         if "does not contain any stream" in err.lower():
-            raise RuntimeError("Không tìm thấy audio trong file.")
-        raise RuntimeError(err or "ffmpeg khong doc duoc file audio")
+            raise AppError("Không tìm thấy audio trong file.", status=415, code="no_audio_stream")
+        raise AppError(
+            user_error_message(err or "ffmpeg khong doc duoc file audio"),
+            status=415,
+            code="unsupported_audio_file",
+        )
     return proc.stdout
 
 
@@ -270,7 +333,11 @@ def first_image_url(track):
 
 def recognize_track():
     if not recognize_lock.acquire(blocking=False):
-        raise RuntimeError("Dang nhan dien roi")
+        raise AppError(
+            "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại.",
+            status=409,
+            code="recognition_busy",
+        )
 
     try:
         started = time.time()
@@ -279,7 +346,7 @@ def recognize_track():
         prev_mark = 0
         result = None
 
-        for mark in ATTEMPT_MARKS:
+        for mark in SYSTEM_ATTEMPT_MARKS:
             chunk_seconds = mark - prev_mark
             prev_mark = mark
             pcm += capture_audio(device, chunk_seconds)
@@ -307,37 +374,36 @@ def recognize_track():
 
 def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_seconds=0):
     if not recognize_lock.acquire(blocking=False):
-        raise RuntimeError("Dang nhan dien roi")
+        raise AppError(
+            "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại.",
+            status=409,
+            code="recognition_busy",
+        )
 
     try:
         started = time.time()
-        requested_seconds = max(1, math.ceil((end_seconds or start_seconds + ATTEMPT_MARKS[-1]) - start_seconds))
+        requested_seconds = max(MIN_UPLOAD_SECONDS, math.ceil((end_seconds or start_seconds + DEFAULT_UPLOAD_SECONDS) - start_seconds))
         pcm = decode_audio_file(audio_bytes, requested_seconds, start_seconds)
         bytes_per_second = RATE * CHANNELS * (BITS // 8)
         if not pcm:
-            raise RuntimeError("File audio khong co du lieu am thanh doc duoc")
+            raise AppError("File không có audio đọc được.", status=415, code="empty_audio")
 
         final_seconds = max(1, math.ceil(len(pcm) / bytes_per_second))
-        attempt_marks = tuple(mark for mark in ATTEMPT_MARKS if mark < final_seconds) + (final_seconds,)
+        if final_seconds < MIN_UPLOAD_SECONDS:
+            raise AppError(
+                "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",
+                status=422,
+                code="audio_too_short",
+            )
 
-        for mark in attempt_marks:
-            sample_size = min(len(pcm), mark * bytes_per_second)
-            if sample_size <= 0:
-                continue
-
-            sample_seconds = max(1, math.ceil(sample_size / bytes_per_second))
-            data = recognize_pcm(pcm[:sample_size], sample_seconds)
-            track = data.get("track") or {}
-            result = result_from_track(track, started, sample_seconds, "upload", filename)
-
-            if result:
-                result["start_seconds"] = start_seconds
-                result["end_seconds"] = start_seconds + sample_seconds
-                save_history(result)
-                return result
-
-            if sample_size == len(pcm):
-                break
+        data = recognize_pcm(pcm, final_seconds)
+        track = data.get("track") or {}
+        result = result_from_track(track, started, final_seconds, "upload", filename)
+        if result:
+            result["start_seconds"] = start_seconds
+            result["end_seconds"] = start_seconds + final_seconds
+            save_history(result)
+            return result
 
         return {
             "ok": True,
@@ -364,6 +430,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_error_json(self, error):
+        if isinstance(error, AppError):
+            payload = {"ok": False, "error": str(error), "code": error.code}
+            self.send_json(error.status, payload)
+            return
+        self.send_json(500, {"ok": False, "error": user_error_message(error), "code": "server_error"})
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -424,27 +497,37 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/recognize-file":
-            content_length = int(self.headers.get("Content-Length") or "0")
+            try:
+                content_length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self.send_json(400, {"ok": False, "error": "Content-Length không hợp lệ.", "code": "bad_content_length"})
+                return
             if content_length <= 0:
-                self.send_json(400, {"ok": False, "error": "Missing audio file"})
+                self.send_json(400, {"ok": False, "error": "Chọn một file audio trước khi nhận diện.", "code": "missing_audio_file"})
                 return
             if content_length > MAX_UPLOAD_BYTES:
-                self.send_json(413, {"ok": False, "error": "File audio qua lon, toi da 50MB"})
+                self.send_json(413, {"ok": False, "error": "File audio quá lớn, tối đa 50MB.", "code": "file_too_large"})
                 return
 
             filename = urllib.parse.unquote(self.headers.get("X-Filename", "")).strip()
+            content_type = self.headers.get("Content-Type", "")
+            try:
+                validate_upload_type(filename, content_type)
+            except AppError as exc:
+                self.send_error_json(exc)
+                return
             try:
                 start_seconds = max(0, float(self.headers.get("X-Start-Seconds") or "0"))
-                end_seconds = max(start_seconds + 1, float(self.headers.get("X-End-Seconds") or str(start_seconds + ATTEMPT_MARKS[-1])))
+                end_seconds = max(start_seconds + 1, float(self.headers.get("X-End-Seconds") or str(start_seconds + DEFAULT_UPLOAD_SECONDS)))
             except ValueError:
-                self.send_json(400, {"ok": False, "error": "Invalid selected range"})
+                self.send_json(400, {"ok": False, "error": "Khoảng audio đã chọn không hợp lệ.", "code": "invalid_selected_range"})
                 return
 
             audio_bytes = self.rfile.read(content_length)
             try:
                 self.send_json(200, recognize_uploaded_file(audio_bytes, filename, start_seconds, end_seconds))
             except Exception as exc:
-                self.send_json(500, {"ok": False, "error": user_error_message(exc)})
+                self.send_error_json(exc)
             return
 
         if parsed.path != "/api/recognize":
@@ -454,7 +537,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_json(200, recognize_track())
         except Exception as exc:
-            self.send_json(500, {"ok": False, "error": user_error_message(exc)})
+            self.send_error_json(exc)
 
 
 def main():

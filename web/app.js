@@ -18,7 +18,26 @@ const historyEl = document.querySelector("#history");
 const clearButton = document.querySelector("#clearButton");
 
 const PREVIEW_SECONDS = 10;
-const MIN_SELECTION_SECONDS = 1;
+const MIN_SELECTION_SECONDS = 3;
+const MIN_UPLOAD_SECONDS = 3;
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(["mp3", "wav", "m4a", "mp4", "flac", "ogg", "webm"]);
+const ALLOWED_UPLOAD_TYPES = new Set([
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/wave",
+  "audio/mp4",
+  "audio/m4a",
+  "audio/x-m4a",
+  "audio/flac",
+  "audio/x-flac",
+  "audio/ogg",
+  "video/mp4",
+  "video/webm",
+  "application/ogg",
+]);
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
 const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";
 const STOP_ICON_PATH = "M7.2 6.2c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2H8.4c-.7 0-1.2-.5-1.2-1.2V6.2Zm5.4 0c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2h-1.8c-.7 0-1.2-.5-1.2-1.2V6.2Z";
@@ -31,6 +50,7 @@ let selectionEnd = PREVIEW_SECONDS;
 let waveformPeaks = [];
 let activeWaveformDrag = "";
 let playbackFrame = 0;
+let selectedFileError = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -42,11 +62,93 @@ function escapeHtml(value) {
 }
 
 function userErrorMessage(error) {
-  const message = String(error || "");
-  if (message.toLowerCase().includes("does not contain any stream")) {
+  const message = String(error?.error || error?.message || error || "");
+  const code = String(error?.code || "");
+  const lowered = message.toLowerCase();
+  if (code === "no_audio_playing") {
+    return "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại.";
+  }
+  if (code === "recognition_busy") {
+    return "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại.";
+  }
+  if (code === "file_too_large") {
+    return "File audio quá lớn, tối đa 50MB.";
+  }
+  if (code === "unsupported_upload_type") {
+    return "Chỉ hỗ trợ file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.";
+  }
+  if (code === "unsupported_audio_file") {
+    return "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.";
+  }
+  if (code === "audio_too_short") {
+    return "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.";
+  }
+  if (code === "no_audio_stream" || lowered.includes("does not contain any stream")) {
     return "Không tìm thấy audio trong file.";
   }
+  if (lowered.includes("invalid data found when processing input")) {
+    return "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.";
+  }
   return message;
+}
+
+async function readApiJson(response) {
+  let data = {};
+  try {
+    data = await response.json();
+  } catch (error) {
+    data = {};
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      error: data.error || `Lỗi ${response.status}`,
+      code: data.code || "http_error",
+    };
+  }
+
+  return data;
+}
+
+function formatBytes(bytes) {
+  const mb = bytes / (1024 * 1024);
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)}MB`;
+}
+
+function renderWarning(message) {
+  resultEl.innerHTML = `<p class="notice warning">${escapeHtml(message)}</p>`;
+}
+
+function fileExtension(filename) {
+  const parts = String(filename || "").toLowerCase().split(".");
+  return parts.length > 1 ? parts.pop() : "";
+}
+
+function validateSelectedFile(file) {
+  if (!file) {
+    return null;
+  }
+
+  const extension = fileExtension(file.name);
+  const type = String(file.type || "").toLowerCase();
+  const allowedByExtension = ALLOWED_UPLOAD_EXTENSIONS.has(extension);
+  const allowedByType = ALLOWED_UPLOAD_TYPES.has(type);
+  if (!allowedByExtension && !allowedByType) {
+    return {
+      code: "unsupported_upload_type",
+      error: "Chỉ hỗ trợ file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.",
+    };
+  }
+
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return {
+      code: "file_too_large",
+      error: `File audio quá lớn (${formatBytes(file.size)}), tối đa 50MB.`,
+    };
+  }
+
+  return null;
 }
 
 function setBusy(isBusy) {
@@ -116,6 +218,7 @@ function resetPreview() {
   selectionStart = 0;
   selectionEnd = PREVIEW_SECONDS;
   waveformPeaks = [];
+  selectedFileError = null;
   updatePreviewRangeText();
   drawWaveform();
   filePreview.classList.add("is-hidden");
@@ -129,12 +232,28 @@ function resetSelectedFile() {
   resetPreview();
 }
 
+function rejectSelectedFile(error) {
+  resetPreview();
+  audioFile.value = "";
+  fileName.textContent = "Chọn file để tìm";
+  previewReset.classList.add("is-hidden");
+  selectedFileError = error;
+  renderResult({ ok: false, ...error });
+}
+
 function loadFilePreview(file) {
   resetPreview();
   if (!file) {
     return;
   }
 
+  selectedFileError = validateSelectedFile(file);
+  if (selectedFileError) {
+    rejectSelectedFile(selectedFileError);
+    return;
+  }
+
+  resultEl.innerHTML = INITIAL_RESULT_HTML;
   previewUrl = URL.createObjectURL(file);
   previewAudio.src = previewUrl;
   filePreview.classList.remove("is-hidden");
@@ -361,12 +480,12 @@ async function copyTrack(item, button) {
 
 function renderResult(data) {
   if (!data.ok) {
-    resultEl.innerHTML = `<p class="muted">${escapeHtml(userErrorMessage(data.error) || "Co loi roi")}</p>`;
+    renderWarning(userErrorMessage(data) || "Có lỗi rồi.");
     return;
   }
 
   if (!data.found) {
-    resultEl.innerHTML = `<p class="muted">Chưa tìm thấy bài nào. Thử tăng âm lượng hoặc chạy lại lần nữa.</p>`;
+    renderWarning("Chưa tìm thấy bài nào. Thử tăng âm lượng hoặc chạy lại lần nữa.");
     return;
   }
 
@@ -480,7 +599,7 @@ async function recognize() {
 
   try {
     const response = await fetch("/api/recognize", { method: "POST" });
-    const data = await response.json();
+    const data = await readApiJson(response);
     renderResult(data);
     await loadHistory();
   } catch (error) {
@@ -494,6 +613,12 @@ async function recognizeFile() {
   const file = audioFile.files?.[0];
   if (!file) {
     resultEl.innerHTML = `<p class="muted">Chọn một file audio trước khi nhận diện.</p>`;
+    return;
+  }
+
+  selectedFileError = selectedFileError || validateSelectedFile(file);
+  if (selectedFileError) {
+    renderResult({ ok: false, ...selectedFileError });
     return;
   }
 
@@ -514,7 +639,7 @@ async function recognizeFile() {
       },
       body: file,
     });
-    const data = await response.json();
+    const data = await readApiJson(response);
     renderResult(data);
     await loadHistory();
   } catch (error) {
@@ -534,12 +659,28 @@ audioFile.addEventListener("change", () => {
 previewAudio.addEventListener("loadedmetadata", () => {
   const duration = Number.isFinite(previewAudio.duration) ? previewAudio.duration : 0;
   previewDuration = duration || previewDuration;
+  if (duration > 0 && duration < MIN_UPLOAD_SECONDS) {
+    rejectSelectedFile({
+      code: "audio_too_short",
+      error: "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",
+    });
+    return;
+  }
   selectionStart = 0;
   selectionEnd = Math.min(PREVIEW_SECONDS, Math.max(MIN_SELECTION_SECONDS, previewDuration || PREVIEW_SECONDS));
   clampSelection();
   previewAudio.currentTime = selectionStart;
   updatePreviewRangeText();
   drawWaveform();
+});
+previewAudio.addEventListener("error", () => {
+  if (!audioFile.files?.[0] || selectedFileError) {
+    return;
+  }
+  rejectSelectedFile({
+    code: "unsupported_audio_file",
+    error: "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.",
+  });
 });
 previewAudio.addEventListener("timeupdate", () => {
   if (!previewAudio.paused && previewAudio.currentTime >= selectedEndSeconds()) {
