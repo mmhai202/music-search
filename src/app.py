@@ -52,6 +52,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT_ENV = os.environ.get("PORT")
 PORT = int(PORT_ENV or "8765")
 OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1") != "0"
+DEBUG_TIMING = os.environ.get("MUSIC_SEARCH_DEBUG_TIMING") == "1"
 SYSTEM_ATTEMPT_MARKS = (3, 6)
 DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
@@ -88,6 +89,16 @@ class AppError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+def timing_log(label, started, **fields):
+    if not DEBUG_TIMING:
+        return
+
+    elapsed = time.monotonic() - started
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    suffix = f" {details}" if details else ""
+    print(f"[timing] {label} elapsed={elapsed:.3f}s{suffix}", file=sys.stderr)
 
 
 def history_id(item):
@@ -322,6 +333,7 @@ def pcm_has_signal(pcm):
 
 
 def decode_audio_file(audio_bytes, seconds, start_seconds=0):
+    started = time.monotonic()
     cmd = [
         executable_path("ffmpeg"),
         "-hide_banner",
@@ -342,6 +354,15 @@ def decode_audio_file(audio_bytes, seconds, start_seconds=0):
         "-",
     ]
     proc = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=False)
+    timing_log(
+        "upload.ffmpeg.decode.done",
+        started,
+        seconds=seconds,
+        start=start_seconds,
+        input_bytes=len(audio_bytes),
+        output_bytes=len(proc.stdout),
+        returncode=proc.returncode,
+    )
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         if "does not contain any stream" in err.lower():
@@ -355,6 +376,7 @@ def decode_audio_file(audio_bytes, seconds, start_seconds=0):
 
 
 def recognize_pcm(pcm, seconds):
+    started = time.monotonic()
     cmd = [
         executable_path("vibra"),
         "--recognize",
@@ -368,6 +390,7 @@ def recognize_pcm(pcm, seconds):
         str(BITS),
     ]
     proc = subprocess.run(cmd, input=pcm, capture_output=True, check=False)
+    timing_log("vibra.recognize.done", started, seconds=seconds, bytes=len(pcm), returncode=proc.returncode)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(err or "vibra failed")
@@ -397,13 +420,17 @@ def terminate_process(proc):
 
 
 def recognize_stream_from_device(device, seconds):
+    started = time.monotonic()
     ffmpeg_cmd = [
         executable_path("ffmpeg"),
+        "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
         "-f",
         "pulse",
+        "-fragment_size",
+        "4096",
         "-i",
         device,
         "-t",
@@ -430,52 +457,75 @@ def recognize_stream_from_device(device, seconds):
     ]
     ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     vibra = subprocess.Popen(vibra_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timing_log("system.stream.started", started, seconds=seconds, device=device)
     first_second = bytearray()
     signal_checked = False
     vibra_pipe_closed = False
-    chunk_size = 16384
+    capture_complete = False
+    target_bytes = math.ceil(seconds * BYTES_PER_SECOND)
+    chunk_size = 4096
+    total_bytes = 0
 
     try:
         while True:
-            chunk = ffmpeg.stdout.read(chunk_size)
+            chunk = ffmpeg.stdout.read1(chunk_size)
             if not chunk:
                 break
+
+            remaining = target_bytes - total_bytes
+            feed_chunk = chunk[:remaining]
+            total_bytes += len(feed_chunk)
 
             if not signal_checked:
                 need = BYTES_PER_SECOND - len(first_second)
                 if need > 0:
-                    first_second.extend(chunk[:need])
+                    first_second.extend(feed_chunk[:need])
                 if len(first_second) >= BYTES_PER_SECOND:
                     signal_checked = True
+                    timing_log("system.signal_check.ready", started, seconds=seconds)
                     if not pcm_has_signal(first_second):
+                        timing_log("system.signal_check.silent", started, seconds=seconds)
                         terminate_process(ffmpeg)
                         terminate_process(vibra)
                         raise no_audio_playing_error()
+                    timing_log("system.signal_check.ok", started, seconds=seconds)
 
             try:
-                vibra.stdin.write(chunk)
+                vibra.stdin.write(feed_chunk)
                 vibra.stdin.flush()
             except BrokenPipeError:
                 vibra_pipe_closed = True
                 terminate_process(ffmpeg)
                 break
 
+            if total_bytes >= target_bytes:
+                capture_complete = True
+                timing_log("system.ffmpeg.target_reached", started, seconds=seconds, bytes=total_bytes)
+                terminate_process(ffmpeg)
+                break
+
         if not signal_checked and not pcm_has_signal(first_second):
+            timing_log("system.signal_check.short_or_silent", started, seconds=seconds)
             raise no_audio_playing_error()
 
         if vibra.stdin and not vibra_pipe_closed:
             vibra.stdin.close()
+        timing_log("system.ffmpeg.stdout_done", started, seconds=seconds, bytes=total_bytes)
         ffmpeg_stderr = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
         ffmpeg_returncode = ffmpeg.wait()
+        timing_log("system.ffmpeg.exited", started, seconds=seconds, returncode=ffmpeg_returncode)
         vibra_stdout = vibra.stdout.read()
         vibra_stderr = vibra.stderr.read().decode("utf-8", errors="replace").strip()
         vibra_returncode = vibra.wait()
+        timing_log("system.vibra.exited", started, seconds=seconds, returncode=vibra_returncode)
 
-        if ffmpeg_returncode != 0:
+        if ffmpeg_returncode != 0 and not capture_complete:
             raise RuntimeError(ffmpeg_stderr or "ffmpeg failed")
         if vibra_returncode != 0:
             raise RuntimeError(vibra_stderr or "vibra failed")
-        return parse_vibra_output(vibra_stdout)
+        data = parse_vibra_output(vibra_stdout)
+        timing_log("system.stream.done", started, seconds=seconds, found=bool(data.get("track")))
+        return data
     finally:
         terminate_process(ffmpeg)
         terminate_process(vibra)
@@ -595,16 +645,23 @@ def recognize_track(selected_device=""):
 
     try:
         started = time.time()
+        timing_started = time.monotonic()
+        timing_log("system.request.started", timing_started, selected=bool(selected_device))
         device = detect_device(selected_device)
+        timing_log("system.detect_device.done", timing_started, device=device)
 
         for mark in SYSTEM_ATTEMPT_MARKS:
+            attempt_started = time.monotonic()
+            timing_log("system.attempt.started", attempt_started, seconds=mark)
             data = recognize_stream_from_device(device, mark)
             track = data.get("track") or {}
             result = result_from_track(track, started, mark, "system")
+            timing_log("system.attempt.done", attempt_started, seconds=mark, found=bool(result))
 
             if result:
                 result["device"] = device
                 save_history(result)
+                timing_log("system.request.done", timing_started, found=True, seconds=mark)
                 return result
 
         result = {
@@ -614,6 +671,7 @@ def recognize_track(selected_device=""):
             "elapsed": round(time.time() - started, 2),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        timing_log("system.request.done", timing_started, found=False)
         return result
     finally:
         recognize_lock.release()
@@ -629,6 +687,8 @@ def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_secon
 
     try:
         started = time.time()
+        timing_started = time.monotonic()
+        timing_log("upload.request.started", timing_started, filename=filename or "-")
         requested_range = (end_seconds or start_seconds + DEFAULT_UPLOAD_SECONDS) - start_seconds
         requested_seconds = max(MIN_AUDIO_SECONDS, math.ceil(requested_range))
         pcm = decode_audio_file(audio_bytes, requested_seconds, start_seconds)
@@ -650,8 +710,10 @@ def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_secon
             result["start_seconds"] = start_seconds
             result["end_seconds"] = start_seconds + final_seconds
             save_history(result)
+            timing_log("upload.request.done", timing_started, found=True, seconds=final_seconds)
             return result
 
+        timing_log("upload.request.done", timing_started, found=False, seconds=final_seconds)
         return {
             "ok": True,
             "found": False,
