@@ -34,6 +34,11 @@ ENV/
 build/
 dist/
 *.egg-info/
+build_linux/.venv/
+build_linux/build/
+build_linux/dist/
+squashfs-root/
+*.AppImage
 
 # OS files
 .DS_Store

@@ -1,11 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+import os
 import shutil
 
 
 build_root = Path(SPECPATH).resolve()
 root = build_root.parent
-datas = [(str(root / "web"), "web")]
+src_root = root / "src"
+artifact_name = os.environ.get("MUSIC_SEARCH_ARTIFACT_NAME", "MusicSearch")
+datas = [
+    (str(src_root / "web"), "web"),
+    (str(build_root / "VERSION"), "."),
+]
 binaries = []
 
 
@@ -21,8 +27,8 @@ for binary_name in ("ffmpeg", "vibra", "pactl"):
 
 
 a = Analysis(
-    [str(root / "app.py")],
-    pathex=[str(root)],
+    [str(src_root / "app.py")],
+    pathex=[str(src_root)],
     binaries=binaries,
     datas=datas,
     hiddenimports=[],
@@ -41,14 +47,14 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="MusicSearch",
+    name=artifact_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

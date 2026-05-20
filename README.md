@@ -13,18 +13,19 @@ Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audi
 - Có link mở kết quả trên Shazam.
 - Lưu lịch sử 10 bài gần nhất.
 
-## Yêu cầu
+## Build prerequisites
 
 Dự án dùng cho Linux có PulseAudio/PipeWire Pulse.
 
-Cần có:
+Môi trường build cần có:
 
 - Python 3
 - `ffmpeg`
 - `pactl`
 - `vibra`
+- `appimagetool`
 
-## Cài đặt
+## Chuẩn bị
 
 Clone repo:
 
@@ -39,41 +40,40 @@ Cài dependency:
 bash scripts/install_deps.sh
 ```
 
-Script này sẽ cài các gói cần thiết và build `vibra`.
+Script này sẽ cài các gói hệ thống cần thiết, cài `appimagetool` nếu máy build chưa có, và build `vibra`.
 
-## Chạy ứng dụng
-
-```bash
-python3 app.py
-```
-
-Sau đó mở trình duyệt:
-
-```text
-http://127.0.0.1:8765
-```
-
-bấm nút **Tìm bài đang phát** để nghe audio hệ thống, hoặc chọn file audio rồi bấm **Tìm kiếm**.
+Source runtime nằm trong `src/`. Thư mục `build_linux/` chứa cấu hình build AppImage.
 
 ## Build Linux
 
-Tạo executable độc lập cho Linux:
+Tạo release artifact cho Linux:
 
 ```bash
 bash build_linux/build_linux.sh --clean
 ```
 
+Dọn artefact build/cache trong workspace:
+
+```bash
+bash scripts/clean_ws.sh
+```
+
 Artifact:
 
 ```text
-build_linux/dist/MusicSearch
+build_linux/dist/MusicSearch-0.1.0-x86_64.AppImage
 ```
 
-Chạy artifact:
+Chạy AppImage:
 
 ```bash
-chmod +x build_linux/dist/MusicSearch
-./build_linux/dist/MusicSearch
+./build_linux/dist/MusicSearch-0.1.0-x86_64.AppImage
 ```
 
-Executable đã bundle code Python, giao diện web, `ffmpeg`, `vibra` và `pactl`. Build artifact trên môi trường Linux tương thích với nền tảng phân phối.
+Khi chạy, ứng dụng tự mở giao diện trong trình duyệt. AppImage đã bundle code Python, giao diện web, `ffmpeg`, `vibra`, `pactl`, desktop metadata và icon. Build artifact trên môi trường Linux tương thích với nền tảng phân phối.
+
+Runtime data như lịch sử nhận diện được lưu theo XDG state, mặc định tại:
+
+```text
+~/.local/state/music-search/history.jsonl
+```

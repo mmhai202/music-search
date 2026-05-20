@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -16,28 +15,43 @@ import webbrowser
 
 
 APP_NAME = "Music Search"
+APP_ID = "music-search"
 IS_FROZEN = getattr(sys, "frozen", False)
-IS_WINDOWS = platform.system() == "Windows"
+ALLOW_SOURCE_RUN = os.environ.get("MUSIC_SEARCH_ALLOW_SOURCE_RUN") == "1"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 RUNTIME_ROOT = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
 PUBLIC = RESOURCE_ROOT / "web"
 
 
+def app_version():
+    candidates = [
+        RESOURCE_ROOT / "VERSION",
+        Path(__file__).resolve().parents[1] / "build_linux" / "VERSION",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8").strip()
+    return "0.0.0"
+
+
+APP_VERSION = app_version()
+ARTIFACT_NAME = f"MusicSearch-{APP_VERSION}-{os.uname().machine}.AppImage"
+
+
 def app_state_dir():
-    if IS_WINDOWS:
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / APP_NAME
-    return RUNTIME_ROOT
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base) / APP_ID
+    return Path.home() / ".local" / "state" / APP_ID
 
 
 STATE_DIR = app_state_dir()
-STATE_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = STATE_DIR / "history.jsonl"
 HISTORY_LIMIT = 10
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT_ENV = os.environ.get("PORT")
 PORT = int(PORT_ENV or "8765")
-OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1" if IS_FROZEN else "0") != "0"
+OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1") != "0"
 SYSTEM_ATTEMPT_MARKS = (3, 6)
 DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
@@ -88,21 +102,20 @@ def normalize_history_item(item):
 
 
 def executable_path(name):
-    exe_name = f"{name}.exe" if IS_WINDOWS else name
     candidates = [
-        RESOURCE_ROOT / "bin" / exe_name,
-        RUNTIME_ROOT / "bin" / exe_name,
-        Path(__file__).resolve().parent / "bin" / exe_name,
+        RESOURCE_ROOT / "bin" / name,
+        RUNTIME_ROOT / "bin" / name,
+        Path(__file__).resolve().parent / "bin" / name,
     ]
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
 
-    found = shutil.which(exe_name) or shutil.which(name)
+    found = shutil.which(name)
     if found:
         return found
     raise AppError(
-        f"Không tìm thấy {exe_name}. Hãy đặt file này trong thư mục bin cạnh ứng dụng.",
+        f"Không tìm thấy {name}. Hãy đặt file này trong thư mục bin cạnh ứng dụng.",
         status=503,
         code="missing_dependency",
     )
@@ -162,13 +175,6 @@ def parse_sinks(pactl_output):
 
 
 def detect_device():
-    if IS_WINDOWS:
-        raise AppError(
-            "Bản Windows hiện hỗ trợ nhận diện từ file audio. Chức năng nghe audio đang phát cần thêm driver loopback hoặc backend audio riêng cho Windows.",
-            status=501,
-            code="system_audio_unsupported",
-        )
-
     forced = os.environ.get("VIBRA_DEVICE", "").strip()
     if forced:
         return forced
@@ -312,6 +318,7 @@ def result_from_track(track, started, seconds, source, filename=""):
 
 
 def write_history(items):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     with HISTORY_FILE.open("w", encoding="utf-8") as fh:
         for history_item in items[-HISTORY_LIMIT:]:
             fh.write(json.dumps(history_item, ensure_ascii=False) + "\n")
@@ -340,6 +347,7 @@ def load_history(limit=HISTORY_LIMIT, oldest_first=False):
 
 
 def clear_history():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.write_text("", encoding="utf-8")
 
 
@@ -591,6 +599,15 @@ def make_server():
 
 
 def main():
+    if not IS_FROZEN and not ALLOW_SOURCE_RUN:
+        print(
+            "Music Search is intended to run from the packaged Linux artifact.\n"
+            "Build it with: bash build_linux/build_linux.sh --clean\n"
+            f"Then run: ./build_linux/dist/{ARTIFACT_NAME}",
+            file=sys.stderr,
+        )
+        return 1
+
     server, port = make_server()
     if port == 0:
         port = server.server_address[1]
@@ -599,7 +616,8 @@ def main():
     if OPEN_BROWSER:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     server.serve_forever()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
