@@ -45,6 +45,8 @@ const ERROR_MESSAGES = {
   unsupported_audio_file: "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM.",
   audio_too_short: "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",
   no_audio_stream: "Không tìm thấy audio trong file.",
+  missing_dependency: "Thiếu ffmpeg hoặc vibra. Kiểm tra thư mục bin cạnh ứng dụng.",
+  system_audio_unsupported: "Bản Windows hiện hỗ trợ nhận diện từ file audio. Chức năng nghe audio đang phát chưa hỗ trợ trực tiếp.",
 };
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
 const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";

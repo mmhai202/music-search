@@ -5,18 +5,39 @@ import hashlib
 import json
 import math
 import os
+import platform
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
+import webbrowser
 
 
-ROOT = Path(__file__).resolve().parent
-PUBLIC = ROOT / "web"
-HISTORY_FILE = ROOT / "history.jsonl"
+APP_NAME = "Music Search"
+IS_FROZEN = getattr(sys, "frozen", False)
+IS_WINDOWS = platform.system() == "Windows"
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+RUNTIME_ROOT = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
+PUBLIC = RESOURCE_ROOT / "web"
+
+
+def app_state_dir():
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / APP_NAME
+    return RUNTIME_ROOT
+
+
+STATE_DIR = app_state_dir()
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_FILE = STATE_DIR / "history.jsonl"
 HISTORY_LIMIT = 10
 HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = int(os.environ.get("PORT", "8765"))
+PORT_ENV = os.environ.get("PORT")
+PORT = int(PORT_ENV or "8765")
+OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1" if IS_FROZEN else "0") != "0"
 SYSTEM_ATTEMPT_MARKS = (3, 6)
 DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
@@ -66,8 +87,30 @@ def normalize_history_item(item):
     return normalized
 
 
+def executable_path(name):
+    exe_name = f"{name}.exe" if IS_WINDOWS else name
+    candidates = [
+        RESOURCE_ROOT / "bin" / exe_name,
+        RUNTIME_ROOT / "bin" / exe_name,
+        Path(__file__).resolve().parent / "bin" / exe_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    found = shutil.which(exe_name) or shutil.which(name)
+    if found:
+        return found
+    raise AppError(
+        f"Không tìm thấy {exe_name}. Hãy đặt file này trong thư mục bin cạnh ứng dụng.",
+        status=503,
+        code="missing_dependency",
+    )
+
+
 def run_text(args):
-    return subprocess.run(args, text=True, capture_output=True, check=False)
+    resolved = [executable_path(args[0]), *args[1:]]
+    return subprocess.run(resolved, text=True, capture_output=True, check=False)
 
 
 def user_error_message(error):
@@ -119,6 +162,13 @@ def parse_sinks(pactl_output):
 
 
 def detect_device():
+    if IS_WINDOWS:
+        raise AppError(
+            "Bản Windows hiện hỗ trợ nhận diện từ file audio. Chức năng nghe audio đang phát cần thêm driver loopback hoặc backend audio riêng cho Windows.",
+            status=501,
+            code="system_audio_unsupported",
+        )
+
     forced = os.environ.get("VIBRA_DEVICE", "").strip()
     if forced:
         return forced
@@ -148,7 +198,7 @@ def detect_device():
 
 def capture_audio(device, seconds):
     cmd = [
-        "ffmpeg",
+        executable_path("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -175,7 +225,7 @@ def capture_audio(device, seconds):
 
 def decode_audio_file(audio_bytes, seconds, start_seconds=0):
     cmd = [
-        "ffmpeg",
+        executable_path("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -208,7 +258,7 @@ def decode_audio_file(audio_bytes, seconds, start_seconds=0):
 
 def recognize_pcm(pcm, seconds):
     cmd = [
-        "vibra",
+        executable_path("vibra"),
         "--recognize",
         "--seconds",
         str(seconds),
@@ -528,9 +578,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(exc)
 
 
+def make_server():
+    if PORT_ENV:
+        return ThreadingHTTPServer((HOST, PORT), Handler), PORT
+
+    for port in range(PORT, PORT + 20):
+        try:
+            return ThreadingHTTPServer((HOST, port), Handler), port
+        except OSError:
+            continue
+    return ThreadingHTTPServer((HOST, 0), Handler), 0
+
+
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Track web running at http://{HOST}:{PORT}")
+    server, port = make_server()
+    if port == 0:
+        port = server.server_address[1]
+    url = f"http://{HOST}:{port}"
+    print(f"Music Search running at {url}")
+    if OPEN_BROWSER:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     server.serve_forever()
 
 

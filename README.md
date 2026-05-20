@@ -15,7 +15,7 @@ Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audi
 
 ## Yêu cầu
 
-Dự án phù hợp nhất với Linux có PulseAudio/PipeWire Pulse.
+Dự án dùng cho Linux có PulseAudio/PipeWire Pulse.
 
 Cần có:
 
@@ -54,3 +54,26 @@ http://127.0.0.1:8765
 ```
 
 bấm nút **Tìm bài đang phát** để nghe audio hệ thống, hoặc chọn file audio rồi bấm **Tìm kiếm**.
+
+## Build Linux
+
+Tạo executable độc lập cho Linux:
+
+```bash
+bash build_linux/build_linux.sh --clean
+```
+
+Artifact:
+
+```text
+build_linux/dist/MusicSearch
+```
+
+Chạy artifact:
+
+```bash
+chmod +x build_linux/dist/MusicSearch
+./build_linux/dist/MusicSearch
+```
+
+Executable đã bundle code Python, giao diện web, `ffmpeg`, `vibra` và `pactl`. Build artifact trên môi trường Linux tương thích với nền tảng phân phối.
