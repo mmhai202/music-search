@@ -78,6 +78,7 @@ ALLOWED_UPLOAD_TYPES = {
 }
 
 recognize_lock = threading.Lock()
+history_lock = threading.RLock()
 
 
 class AppError(RuntimeError):
@@ -174,7 +175,63 @@ def parse_sinks(pactl_output):
     return sinks
 
 
-def detect_device():
+def parse_sources(pactl_output):
+    sources = []
+    current = {}
+
+    for raw_line in pactl_output.splitlines():
+        line = raw_line.strip()
+        if raw_line.startswith("Source #"):
+            if current:
+                sources.append(current)
+            current = {}
+        elif line.startswith("Name:"):
+            current["name"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Description:"):
+            current["description"] = line.split(":", 1)[1].strip()
+        elif line.startswith("State:"):
+            current["state"] = line.split(":", 1)[1].strip()
+
+    if current:
+        sources.append(current)
+    return sources
+
+
+def list_audio_devices():
+    listed = run_text(["pactl", "list", "sources"])
+    if listed.returncode != 0:
+        raise RuntimeError("Khong doc duoc pactl list sources")
+
+    devices = []
+    for source in parse_sources(listed.stdout):
+        name = source.get("name") or ""
+        if not name:
+            continue
+        state = source.get("state") or ""
+        devices.append(
+            {
+                "id": name,
+                "label": source.get("description") or name,
+                "state": state,
+                "active": state == "RUNNING",
+                "kind": "monitor" if name.endswith(".monitor") else "input",
+            }
+        )
+    return devices
+
+
+def detect_device(selected_device=""):
+    selected = selected_device.strip()
+    if selected:
+        devices = list_audio_devices()
+        if not any(device["id"] == selected for device in devices):
+            raise AppError(
+                "Thiết bị audio đã chọn không còn khả dụng. Chọn Auto hoặc tải lại danh sách.",
+                status=404,
+                code="audio_device_not_found",
+            )
+        return selected
+
     forced = os.environ.get("VIBRA_DEVICE", "").strip()
     if forced:
         return forced
@@ -325,37 +382,56 @@ def write_history(items):
 
 
 def save_history(item):
-    items = load_history(oldest_first=True)
-    items.append(normalize_history_item(item))
-    write_history(items)
+    with history_lock:
+        items = load_history(oldest_first=True)
+        items.append(normalize_history_item(item))
+        write_history(items)
 
 
 def load_history(limit=HISTORY_LIMIT, oldest_first=False):
-    if not HISTORY_FILE.exists():
-        return []
+    with history_lock:
+        if not HISTORY_FILE.exists():
+            return []
 
-    lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
-    items = []
-    for line in lines:
-        try:
-            items.append(normalize_history_item(json.loads(line)))
-        except json.JSONDecodeError:
-            continue
-    if oldest_first:
-        return items
-    return list(reversed(items))
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+        items = []
+        for line in lines:
+            try:
+                items.append(normalize_history_item(json.loads(line)))
+            except json.JSONDecodeError:
+                continue
+        if oldest_first:
+            return items
+        return list(reversed(items))
 
 
 def clear_history():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text("", encoding="utf-8")
+    with history_lock:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        HISTORY_FILE.write_text("", encoding="utf-8")
 
 
 def delete_history_item(item_id):
-    items = load_history(oldest_first=True)
-    kept = [item for item in items if item.get("id") != item_id]
-    write_history(kept)
-    return kept
+    with history_lock:
+        items = load_history(oldest_first=True)
+        kept = [item for item in items if item.get("id") != item_id]
+        write_history(kept)
+        return kept
+
+
+def static_target(path):
+    if path == "/":
+        path = "/index.html"
+
+    public_root = PUBLIC.resolve()
+    target = (public_root / path.lstrip("/")).resolve()
+    try:
+        target.relative_to(public_root)
+    except ValueError:
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    return target
 
 
 def first_image_url(track):
@@ -374,7 +450,7 @@ def first_image_url(track):
     return ""
 
 
-def recognize_track():
+def recognize_track(selected_device=""):
     if not recognize_lock.acquire(blocking=False):
         raise AppError(
             "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại.",
@@ -384,7 +460,7 @@ def recognize_track():
 
     try:
         started = time.time()
-        device = detect_device()
+        device = detect_device(selected_device)
         pcm = b""
         prev_mark = 0
 
@@ -490,12 +566,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"items": load_history()})
             return
 
-        path = parsed.path
-        if path == "/":
-            path = "/index.html"
+        if parsed.path == "/api/devices":
+            try:
+                self.send_json(200, {"devices": list_audio_devices()})
+            except Exception as exc:
+                self.send_error_json(exc)
+            return
 
-        target = (PUBLIC / path.lstrip("/")).resolve()
-        if not str(target).startswith(str(PUBLIC.resolve())) or not target.exists():
+        target = static_target(parsed.path)
+        if not target:
             self.send_error(404)
             return
 
@@ -516,9 +595,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
-        path = "/index.html" if parsed.path == "/" else parsed.path
-        target = (PUBLIC / path.lstrip("/")).resolve()
-        if not str(target).startswith(str(PUBLIC.resolve())) or not target.exists():
+        target = static_target(parsed.path)
+        if not target:
             self.send_error(404)
             return
 
@@ -580,8 +658,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
+        query = urllib.parse.parse_qs(parsed.query)
+        selected_device = (query.get("device") or [""])[0]
         try:
-            self.send_json(200, recognize_track())
+            self.send_json(200, recognize_track(selected_device))
         except Exception as exc:
             self.send_error_json(exc)
 

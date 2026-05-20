@@ -1,5 +1,7 @@
 const listenButton = document.querySelector("#listenButton");
 const buttonText = document.querySelector("#buttonText");
+const deviceSelect = document.querySelector("#deviceSelect");
+const selectedDeviceText = document.querySelector("#selectedDeviceText");
 const audioFile = document.querySelector("#audioFile");
 const fileName = document.querySelector("#fileName");
 const uploadButton = document.querySelector("#uploadButton");
@@ -46,6 +48,7 @@ const ERROR_MESSAGES = {
   audio_too_short: "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",
   no_audio_stream: "Không tìm thấy audio trong file.",
   missing_dependency: "Thiếu ffmpeg hoặc vibra. Kiểm tra thư mục bin cạnh ứng dụng.",
+  audio_device_not_found: "Không tìm thấy thiết bị audio để thu âm.",
 };
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
 const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";
@@ -147,6 +150,7 @@ function validateSelectedFile(file) {
 
 function setBusy(isBusy) {
   listenButton.disabled = isBusy;
+  deviceSelect.disabled = isBusy;
   uploadButton.disabled = isBusy;
   audioFile.disabled = isBusy;
   previewPlay.disabled = isBusy || !audioFile.files?.[0];
@@ -155,6 +159,50 @@ function setBusy(isBusy) {
   listenButton.classList.toggle("is-listening", isBusy);
   buttonText.textContent = isBusy ? "Đang nghe..." : "Tìm bài đang phát";
   uploadButtonText.textContent = isBusy ? "Đang tìm..." : "Tìm kiếm";
+}
+
+function deviceLabel(device) {
+  const label = device.label || device.id || "Audio device";
+  return device.active ? `${label} (đang phát)` : label;
+}
+
+function updateSelectedDeviceText() {
+  const selectedOption = deviceSelect.options[deviceSelect.selectedIndex];
+  selectedDeviceText.textContent = selectedOption?.textContent || "Auto";
+}
+
+function renderDevices(devices) {
+  const selected = deviceSelect.value;
+  deviceSelect.innerHTML = `<option value="">Auto</option>`;
+  for (const device of devices) {
+    const option = document.createElement("option");
+    option.value = device.id || "";
+    option.textContent = deviceLabel(device);
+    deviceSelect.appendChild(option);
+  }
+
+  if (selected && devices.some((device) => device.id === selected)) {
+    deviceSelect.value = selected;
+  }
+  updateSelectedDeviceText();
+}
+
+async function loadDevices() {
+  try {
+    const response = await fetch(`/api/devices?t=${Date.now()}`, { cache: "no-store" });
+    const data = await readApiJson(response);
+    if (!data.ok && data.error) {
+      throw new Error(userErrorMessage(data));
+    }
+    renderDevices(data.devices || []);
+  } catch (error) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Auto";
+    deviceSelect.innerHTML = "";
+    deviceSelect.appendChild(option);
+    updateSelectedDeviceText();
+  }
 }
 
 function formatTime(value) {
@@ -590,7 +638,9 @@ async function recognize() {
   resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy...</p>`;
 
   try {
-    const response = await fetch("/api/recognize", { method: "POST" });
+    const device = deviceSelect.value;
+    const query = device ? `?device=${encodeURIComponent(device)}` : "";
+    const response = await fetch(`/api/recognize${query}`, { method: "POST" });
     const data = await readApiJson(response);
     renderResult(data);
     await loadHistory();
@@ -642,6 +692,7 @@ async function recognizeFile() {
 }
 
 listenButton.addEventListener("click", recognize);
+deviceSelect.addEventListener("change", updateSelectedDeviceText);
 uploadButton.addEventListener("click", recognizeFile);
 audioFile.addEventListener("change", () => {
   const file = audioFile.files?.[0];
@@ -776,3 +827,4 @@ historyEl.addEventListener("click", async (event) => {
 loadHistory().catch((error) => {
   historyEl.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
 });
+loadDevices();

@@ -9,6 +9,7 @@ Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audi
 ## Tính năng
 
 - Nhận diện bài hát đang phát trên máy.
+- Chọn nguồn audio thủ công hoặc để Auto tự chọn nguồn đang phát.
 - Nhận diện bài hát từ file audio upload.
 - Có link mở kết quả trên Shazam.
 - Lưu lịch sử 10 bài gần nhất.
