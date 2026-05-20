@@ -51,6 +51,7 @@ const ERROR_MESSAGES = {
   audio_device_not_found: "Không tìm thấy thiết bị audio để thu âm.",
 };
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
+const DEVICE_REFRESH_MS = 2000;
 const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";
 const STOP_ICON_PATH = "M7.2 6.2c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2H8.4c-.7 0-1.2-.5-1.2-1.2V6.2Zm5.4 0c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2h-1.8c-.7 0-1.2-.5-1.2-1.2V6.2Z";
 
@@ -62,6 +63,7 @@ let selectionEnd = PREVIEW_SECONDS;
 let waveformPeaks = [];
 let activeWaveformDrag = "";
 let playbackFrame = 0;
+let busyState = false;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -149,16 +151,17 @@ function validateSelectedFile(file) {
 }
 
 function setBusy(isBusy) {
-  listenButton.disabled = isBusy;
-  deviceSelect.disabled = isBusy;
-  uploadButton.disabled = isBusy;
-  audioFile.disabled = isBusy;
-  previewPlay.disabled = isBusy || !audioFile.files?.[0];
-  previewReset.disabled = isBusy;
-  waveformBox.classList.toggle("is-disabled", isBusy || !audioFile.files?.[0]);
-  listenButton.classList.toggle("is-listening", isBusy);
-  buttonText.textContent = isBusy ? "Đang nghe..." : "Tìm bài đang phát";
-  uploadButtonText.textContent = isBusy ? "Đang tìm..." : "Tìm kiếm";
+  busyState = isBusy;
+  listenButton.disabled = busyState;
+  deviceSelect.disabled = busyState;
+  uploadButton.disabled = busyState;
+  audioFile.disabled = busyState;
+  previewPlay.disabled = busyState || !audioFile.files?.[0];
+  previewReset.disabled = busyState;
+  waveformBox.classList.toggle("is-disabled", busyState || !audioFile.files?.[0]);
+  listenButton.classList.toggle("is-listening", busyState);
+  buttonText.textContent = busyState ? "Đang nghe..." : "Tìm bài đang phát";
+  uploadButtonText.textContent = busyState ? "Đang tìm..." : "Tìm kiếm";
 }
 
 function deviceLabel(device) {
@@ -188,6 +191,10 @@ function renderDevices(devices) {
 }
 
 async function loadDevices() {
+  if (busyState) {
+    return;
+  }
+
   try {
     const response = await fetch(`/api/devices?t=${Date.now()}`, { cache: "no-store" });
     const data = await readApiJson(response);
@@ -203,6 +210,19 @@ async function loadDevices() {
     deviceSelect.appendChild(option);
     updateSelectedDeviceText();
   }
+}
+
+function startDeviceRefresh() {
+  loadDevices();
+  setInterval(() => {
+    loadDevices();
+  }, DEVICE_REFRESH_MS);
+  window.addEventListener("focus", loadDevices);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      loadDevices();
+    }
+  });
 }
 
 function formatTime(value) {
@@ -827,4 +847,4 @@ historyEl.addEventListener("click", async (event) => {
 loadHistory().catch((error) => {
   historyEl.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
 });
-loadDevices();
+startDeviceRefresh();

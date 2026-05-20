@@ -57,8 +57,10 @@ DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
 CHANNELS = 1
 BITS = 32
+BYTES_PER_SECOND = RATE * CHANNELS * (BITS // 8)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MIN_AUDIO_SECONDS = 3
+PCM_SIGNAL_THRESHOLD = 1024
 ALLOWED_UPLOAD_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".flac", ".ogg", ".webm"}
 ALLOWED_UPLOAD_TYPES = {
     "audio/mpeg",
@@ -153,6 +155,14 @@ def validate_upload_type(filename, content_type):
     )
 
 
+def no_audio_playing_error():
+    return AppError(
+        "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại.",
+        status=409,
+        code="no_audio_playing",
+    )
+
+
 def parse_sinks(pactl_output):
     sinks = []
     current = {}
@@ -198,23 +208,34 @@ def parse_sources(pactl_output):
 
 
 def list_audio_devices():
-    listed = run_text(["pactl", "list", "sources"])
-    if listed.returncode != 0:
+    listed_sources = run_text(["pactl", "list", "sources"])
+    if listed_sources.returncode != 0:
         raise RuntimeError("Khong doc duoc pactl list sources")
 
+    listed_sinks = run_text(["pactl", "list", "sinks"])
+    if listed_sinks.returncode != 0:
+        raise RuntimeError("Khong doc duoc pactl list sinks")
+
+    running_monitors = {
+        sink["monitor"]
+        for sink in parse_sinks(listed_sinks.stdout)
+        if sink.get("state") == "RUNNING" and sink.get("monitor")
+    }
+
     devices = []
-    for source in parse_sources(listed.stdout):
+    for source in parse_sources(listed_sources.stdout):
         name = source.get("name") or ""
         if not name:
             continue
         state = source.get("state") or ""
+        is_monitor = name.endswith(".monitor")
         devices.append(
             {
                 "id": name,
                 "label": source.get("description") or name,
                 "state": state,
-                "active": state == "RUNNING",
-                "kind": "monitor" if name.endswith(".monitor") else "input",
+                "active": name in running_monitors if is_monitor else state == "RUNNING",
+                "kind": "monitor" if is_monitor else "input",
             }
         )
     return devices
@@ -224,12 +245,15 @@ def detect_device(selected_device=""):
     selected = selected_device.strip()
     if selected:
         devices = list_audio_devices()
-        if not any(device["id"] == selected for device in devices):
+        selected_info = next((device for device in devices if device["id"] == selected), None)
+        if not selected_info:
             raise AppError(
                 "Thiết bị audio đã chọn không còn khả dụng. Chọn Auto hoặc tải lại danh sách.",
                 status=404,
                 code="audio_device_not_found",
             )
+        if not selected_info.get("active"):
+            raise no_audio_playing_error()
         return selected
 
     forced = os.environ.get("VIBRA_DEVICE", "").strip()
@@ -246,11 +270,7 @@ def detect_device(selected_device=""):
             return sink["monitor"]
 
     if sinks:
-        raise AppError(
-            "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại.",
-            status=409,
-            code="no_audio_playing",
-        )
+        raise no_audio_playing_error()
 
     raise AppError(
         "Không tìm thấy thiết bị audio để thu âm.",
@@ -284,6 +304,21 @@ def capture_audio(device, seconds):
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(err or "ffmpeg failed")
     return proc.stdout
+
+
+def pcm_has_signal(pcm):
+    sample_width = BITS // 8
+    if len(pcm) < sample_width:
+        return False
+
+    # PCM is s32le; sampling every ~20ms is enough to reject digital silence.
+    samples_per_probe = max(1, RATE // 50)
+    byte_step = samples_per_probe * CHANNELS * sample_width
+    for offset in range(0, len(pcm) - sample_width + 1, byte_step):
+        sample = int.from_bytes(pcm[offset:offset + sample_width], byteorder="little", signed=True)
+        if abs(sample) > PCM_SIGNAL_THRESHOLD:
+            return True
+    return False
 
 
 def decode_audio_file(audio_bytes, seconds, start_seconds=0):
@@ -337,13 +372,113 @@ def recognize_pcm(pcm, seconds):
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(err or "vibra failed")
 
-    raw = proc.stdout.decode("utf-8", errors="replace").strip()
+    return parse_vibra_output(proc.stdout)
+
+
+def parse_vibra_output(raw):
+    raw = raw.decode("utf-8", errors="replace").strip()
     if not raw:
         return {}
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"vibra returned invalid JSON: {exc}") from exc
+
+
+def terminate_process(proc):
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def recognize_stream_from_device(device, seconds):
+    ffmpeg_cmd = [
+        executable_path("ffmpeg"),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "pulse",
+        "-i",
+        device,
+        "-t",
+        str(seconds),
+        "-ac",
+        str(CHANNELS),
+        "-ar",
+        str(RATE),
+        "-f",
+        "s32le",
+        "-",
+    ]
+    vibra_cmd = [
+        executable_path("vibra"),
+        "--recognize",
+        "--seconds",
+        str(seconds),
+        "--rate",
+        str(RATE),
+        "--channels",
+        str(CHANNELS),
+        "--bits",
+        str(BITS),
+    ]
+    ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    vibra = subprocess.Popen(vibra_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    first_second = bytearray()
+    signal_checked = False
+    vibra_pipe_closed = False
+    chunk_size = 16384
+
+    try:
+        while True:
+            chunk = ffmpeg.stdout.read(chunk_size)
+            if not chunk:
+                break
+
+            if not signal_checked:
+                need = BYTES_PER_SECOND - len(first_second)
+                if need > 0:
+                    first_second.extend(chunk[:need])
+                if len(first_second) >= BYTES_PER_SECOND:
+                    signal_checked = True
+                    if not pcm_has_signal(first_second):
+                        terminate_process(ffmpeg)
+                        terminate_process(vibra)
+                        raise no_audio_playing_error()
+
+            try:
+                vibra.stdin.write(chunk)
+                vibra.stdin.flush()
+            except BrokenPipeError:
+                vibra_pipe_closed = True
+                terminate_process(ffmpeg)
+                break
+
+        if not signal_checked and not pcm_has_signal(first_second):
+            raise no_audio_playing_error()
+
+        if vibra.stdin and not vibra_pipe_closed:
+            vibra.stdin.close()
+        ffmpeg_stderr = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
+        ffmpeg_returncode = ffmpeg.wait()
+        vibra_stdout = vibra.stdout.read()
+        vibra_stderr = vibra.stderr.read().decode("utf-8", errors="replace").strip()
+        vibra_returncode = vibra.wait()
+
+        if ffmpeg_returncode != 0:
+            raise RuntimeError(ffmpeg_stderr or "ffmpeg failed")
+        if vibra_returncode != 0:
+            raise RuntimeError(vibra_stderr or "vibra failed")
+        return parse_vibra_output(vibra_stdout)
+    finally:
+        terminate_process(ffmpeg)
+        terminate_process(vibra)
 
 
 def result_from_track(track, started, seconds, source, filename=""):
@@ -461,15 +596,9 @@ def recognize_track(selected_device=""):
     try:
         started = time.time()
         device = detect_device(selected_device)
-        pcm = b""
-        prev_mark = 0
 
         for mark in SYSTEM_ATTEMPT_MARKS:
-            chunk_seconds = mark - prev_mark
-            prev_mark = mark
-            pcm += capture_audio(device, chunk_seconds)
-
-            data = recognize_pcm(pcm, mark)
+            data = recognize_stream_from_device(device, mark)
             track = data.get("track") or {}
             result = result_from_track(track, started, mark, "system")
 
@@ -503,11 +632,10 @@ def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_secon
         requested_range = (end_seconds or start_seconds + DEFAULT_UPLOAD_SECONDS) - start_seconds
         requested_seconds = max(MIN_AUDIO_SECONDS, math.ceil(requested_range))
         pcm = decode_audio_file(audio_bytes, requested_seconds, start_seconds)
-        bytes_per_second = RATE * CHANNELS * (BITS // 8)
         if not pcm:
             raise AppError("File không có audio đọc được.", status=415, code="empty_audio")
 
-        final_seconds = max(1, math.ceil(len(pcm) / bytes_per_second))
+        final_seconds = max(1, math.ceil(len(pcm) / BYTES_PER_SECOND))
         if final_seconds < MIN_AUDIO_SECONDS:
             raise AppError(
                 "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",

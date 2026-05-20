@@ -62,13 +62,13 @@ bash scripts/clean_ws.sh
 Artifact:
 
 ```text
-build_linux/dist/MusicSearch-0.1.0-x86_64.AppImage
+build_linux/dist/MusicSearch-0.2.0-x86_64.AppImage
 ```
 
 Chạy AppImage:
 
 ```bash
-./build_linux/dist/MusicSearch-0.1.0-x86_64.AppImage
+./build_linux/dist/MusicSearch-0.2.0-x86_64.AppImage
 ```
 
 Khi chạy, ứng dụng tự mở giao diện trong trình duyệt. AppImage đã bundle code Python, giao diện web, `ffmpeg`, `vibra`, `pactl`, desktop metadata và icon. Build artifact trên môi trường Linux tương thích với nền tảng phân phối.
