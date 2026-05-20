@@ -1,14 +1,10 @@
 :root {
   color-scheme: light;
-  --bg: #fff7fb;
   --ink: #27212b;
   --muted: #7d7082;
   --line: #eadbe6;
-  --panel: #ffffff;
   --rose: #ff5f9e;
   --rose-dark: #d93477;
-  --mint: #86dfc4;
-  --sun: #ffd166;
   --warning-bg: #fff4c7;
   --warning-line: #f1c75b;
   --warning-ink: #7a4c00;

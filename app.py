@@ -23,7 +23,7 @@ RATE = 44100
 CHANNELS = 1
 BITS = 32
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-MIN_UPLOAD_SECONDS = 3
+MIN_AUDIO_SECONDS = 3
 ALLOWED_UPLOAD_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".flac", ".ogg", ".webm"}
 ALLOWED_UPLOAD_TYPES = {
     "audio/mpeg",
@@ -73,16 +73,12 @@ def run_text(args):
 def user_error_message(error):
     message = str(error)
     lowered = message.lower()
-    if "dang nhan dien roi" in lowered:
-        return "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại."
     if "does not contain any stream" in lowered:
         return "Không tìm thấy audio trong file."
     if "invalid data found when processing input" in lowered:
         return "Định dạng file không đọc được. Thử file MP3, WAV, M4A, MP4, FLAC, OGG hoặc WEBM."
     if "file audio khong co du lieu am thanh doc duoc" in lowered:
         return "File không có audio đọc được."
-    if "khong co audio dang phat" in lowered:
-        return "Không có audio đang phát. Mở nhạc hoặc video rồi thử lại."
     return message
 
 
@@ -142,17 +138,6 @@ def detect_device():
             status=409,
             code="no_audio_playing",
         )
-
-    default = run_text(["pactl", "get-default-sink"])
-    default_sink = default.stdout.strip() if default.returncode == 0 else ""
-    if default_sink:
-        for sink in sinks:
-            if sink.get("name") == default_sink and sink.get("monitor"):
-                return sink["monitor"]
-
-    for sink in sinks:
-        if sink.get("monitor"):
-            return sink["monitor"]
 
     raise AppError(
         "Không tìm thấy thiết bị audio để thu âm.",
@@ -344,7 +329,6 @@ def recognize_track():
         device = detect_device()
         pcm = b""
         prev_mark = 0
-        result = None
 
         for mark in SYSTEM_ATTEMPT_MARKS:
             chunk_seconds = mark - prev_mark
@@ -382,14 +366,15 @@ def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_secon
 
     try:
         started = time.time()
-        requested_seconds = max(MIN_UPLOAD_SECONDS, math.ceil((end_seconds or start_seconds + DEFAULT_UPLOAD_SECONDS) - start_seconds))
+        requested_range = (end_seconds or start_seconds + DEFAULT_UPLOAD_SECONDS) - start_seconds
+        requested_seconds = max(MIN_AUDIO_SECONDS, math.ceil(requested_range))
         pcm = decode_audio_file(audio_bytes, requested_seconds, start_seconds)
         bytes_per_second = RATE * CHANNELS * (BITS // 8)
         if not pcm:
             raise AppError("File không có audio đọc được.", status=415, code="empty_audio")
 
         final_seconds = max(1, math.ceil(len(pcm) / bytes_per_second))
-        if final_seconds < MIN_UPLOAD_SECONDS:
+        if final_seconds < MIN_AUDIO_SECONDS:
             raise AppError(
                 "File audio quá ngắn. Cần tối thiểu 3 giây để nhận diện.",
                 status=422,
@@ -436,7 +421,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"ok": False, "error": str(error), "code": error.code}
             self.send_json(error.status, payload)
             return
-        self.send_json(500, {"ok": False, "error": user_error_message(error), "code": "server_error"})
+        self.send_json(
+            500,
+            {"ok": False, "error": user_error_message(error), "code": "server_error"},
+        )
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)

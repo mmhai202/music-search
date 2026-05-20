@@ -53,4 +53,4 @@ Sau đó mở trình duyệt:
 http://127.0.0.1:8765
 ```
 
-bấm nút **Tìm bài đang phát** để nghe audio hệ thống, hoặc chọn file audio rồi bấm **Nhận diện file audio**.
+bấm nút **Tìm bài đang phát** để nghe audio hệ thống, hoặc chọn file audio rồi bấm **Tìm kiếm**.
