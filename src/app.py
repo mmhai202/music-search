@@ -53,6 +53,9 @@ PORT_ENV = os.environ.get("PORT")
 PORT = int(PORT_ENV or "8765")
 OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1") != "0"
 DEBUG_TIMING = os.environ.get("MUSIC_SEARCH_DEBUG_TIMING") == "1"
+AUTO_SHUTDOWN = os.environ.get("MUSIC_SEARCH_AUTO_SHUTDOWN", "1") != "0"
+CLIENT_HEARTBEAT_TIMEOUT = 8
+CLIENT_SHUTDOWN_GRACE = 2
 SYSTEM_ATTEMPT_MARKS = (3, 6)
 DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
@@ -82,6 +85,11 @@ ALLOWED_UPLOAD_TYPES = {
 
 recognize_lock = threading.Lock()
 history_lock = threading.RLock()
+client_lock = threading.Lock()
+client_seen = {}
+client_tracking_started = False
+shutdown_scheduled = False
+http_server = None
 
 
 class AppError(RuntimeError):
@@ -99,6 +107,72 @@ def timing_log(label, started, **fields):
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     suffix = f" {details}" if details else ""
     print(f"[timing] {label} elapsed={elapsed:.3f}s{suffix}", file=sys.stderr)
+
+
+def active_client_count(now=None):
+    now = now or time.monotonic()
+    expired_before = now - CLIENT_HEARTBEAT_TIMEOUT
+    expired = [
+        client_id
+        for client_id, seen_at in client_seen.items()
+        if seen_at < expired_before
+    ]
+    for client_id in expired:
+        client_seen.pop(client_id, None)
+    return len(client_seen)
+
+
+def mark_client_seen(client_id):
+    global client_tracking_started
+    if not client_id or not AUTO_SHUTDOWN:
+        return
+
+    with client_lock:
+        client_tracking_started = True
+        client_seen[client_id] = time.monotonic()
+
+
+def mark_client_closed(client_id):
+    if not client_id or not AUTO_SHUTDOWN:
+        return
+
+    with client_lock:
+        client_seen.pop(client_id, None)
+        should_shutdown = client_tracking_started and active_client_count() == 0
+    if should_shutdown:
+        schedule_shutdown_if_idle("last client closed")
+
+
+def schedule_shutdown_if_idle(reason):
+    global shutdown_scheduled
+    if not AUTO_SHUTDOWN:
+        return
+
+    with client_lock:
+        if shutdown_scheduled:
+            return
+        shutdown_scheduled = True
+
+    def shutdown_when_still_idle():
+        global shutdown_scheduled
+        time.sleep(CLIENT_SHUTDOWN_GRACE)
+        with client_lock:
+            shutdown_scheduled = False
+            should_shutdown = client_tracking_started and active_client_count() == 0
+        if should_shutdown and http_server:
+            print(f"Music Search shutting down: {reason}", file=sys.stderr)
+            http_server.shutdown()
+
+    threading.Thread(target=shutdown_when_still_idle, daemon=True).start()
+
+
+def monitor_clients():
+    while True:
+        time.sleep(1)
+        with client_lock:
+            should_shutdown = client_tracking_started and active_client_count() == 0
+        if should_shutdown:
+            schedule_shutdown_if_idle("browser heartbeat stopped")
 
 
 def history_id(item):
@@ -487,11 +561,16 @@ def terminate_process(proc):
         proc.wait()
 
 
-def recognize_stream_from_device(device, seconds, silence_error=None, log_prefix="system"):
+def recognize_stream_attempts_from_device(device, marks, silence_error=None, log_prefix="system"):
     if silence_error is None:
         silence_error = no_audio_playing_error
 
+    marks = tuple(sorted(set(marks)))
+    if not marks:
+        return {}, 0
+
     started = time.monotonic()
+    max_seconds = marks[-1]
     ffmpeg_cmd = [
         executable_path("ffmpeg"),
         "-nostdin",
@@ -505,7 +584,7 @@ def recognize_stream_from_device(device, seconds, silence_error=None, log_prefix
         "-i",
         device,
         "-t",
-        str(seconds),
+        str(max_seconds),
         "-ac",
         str(CHANNELS),
         "-ar",
@@ -514,30 +593,24 @@ def recognize_stream_from_device(device, seconds, silence_error=None, log_prefix
         "s32le",
         "-",
     ]
-    vibra_cmd = [
-        executable_path("vibra"),
-        "--recognize",
-        "--seconds",
-        str(seconds),
-        "--rate",
-        str(RATE),
-        "--channels",
-        str(CHANNELS),
-        "--bits",
-        str(BITS),
-    ]
     ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    vibra = subprocess.Popen(vibra_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    timing_log(f"{log_prefix}.stream.started", started, seconds=seconds, device=device)
-    first_second = bytearray()
-    signal_checked = False
-    vibra_pipe_closed = False
-    capture_complete = False
-    target_bytes = math.ceil(seconds * BYTES_PER_SECOND)
+    timing_log(f"{log_prefix}.stream.started", started, seconds=max_seconds, device=device)
+    condition = threading.Condition()
+    pcm_buffer = bytearray()
+    state = {
+        "done": False,
+        "error": None,
+        "ffmpeg_stderr": "",
+        "ffmpeg_returncode": None,
+        "capture_complete": False,
+        "signal_checked": False,
+    }
+    target_bytes = math.ceil(max_seconds * BYTES_PER_SECOND)
     chunk_size = 4096
-    total_bytes = 0
 
-    try:
+    def read_stream():
+        first_second = bytearray()
+        total_bytes = 0
         while True:
             chunk = ffmpeg.stdout.read1(chunk_size)
             if not chunk:
@@ -546,60 +619,80 @@ def recognize_stream_from_device(device, seconds, silence_error=None, log_prefix
             remaining = target_bytes - total_bytes
             feed_chunk = chunk[:remaining]
             total_bytes += len(feed_chunk)
+            with condition:
+                pcm_buffer.extend(feed_chunk)
+                condition.notify_all()
 
-            if not signal_checked:
+            if not state["signal_checked"]:
                 need = BYTES_PER_SECOND - len(first_second)
                 if need > 0:
                     first_second.extend(feed_chunk[:need])
                 if len(first_second) >= BYTES_PER_SECOND:
-                    signal_checked = True
-                    timing_log(f"{log_prefix}.signal_check.ready", started, seconds=seconds)
+                    state["signal_checked"] = True
+                    timing_log(f"{log_prefix}.signal_check.ready", started, seconds=max_seconds)
                     if not pcm_has_signal(first_second):
-                        timing_log(f"{log_prefix}.signal_check.silent", started, seconds=seconds)
+                        timing_log(f"{log_prefix}.signal_check.silent", started, seconds=max_seconds)
+                        with condition:
+                            state["error"] = silence_error()
+                            condition.notify_all()
                         terminate_process(ffmpeg)
-                        terminate_process(vibra)
-                        raise silence_error()
-                    timing_log(f"{log_prefix}.signal_check.ok", started, seconds=seconds)
-
-            try:
-                vibra.stdin.write(feed_chunk)
-                vibra.stdin.flush()
-            except BrokenPipeError:
-                vibra_pipe_closed = True
-                terminate_process(ffmpeg)
-                break
+                        return
+                    timing_log(f"{log_prefix}.signal_check.ok", started, seconds=max_seconds)
 
             if total_bytes >= target_bytes:
-                capture_complete = True
-                timing_log(f"{log_prefix}.ffmpeg.target_reached", started, seconds=seconds, bytes=total_bytes)
+                state["capture_complete"] = True
+                timing_log(f"{log_prefix}.ffmpeg.target_reached", started, seconds=max_seconds, bytes=total_bytes)
                 terminate_process(ffmpeg)
                 break
 
-        if not signal_checked and not pcm_has_signal(first_second):
-            timing_log(f"{log_prefix}.signal_check.short_or_silent", started, seconds=seconds)
-            raise silence_error()
+        if not state["signal_checked"] and not pcm_has_signal(first_second):
+            timing_log(f"{log_prefix}.signal_check.short_or_silent", started, seconds=max_seconds)
+            with condition:
+                state["error"] = silence_error()
+                condition.notify_all()
+            return
 
-        if vibra.stdin and not vibra_pipe_closed:
-            vibra.stdin.close()
-        timing_log(f"{log_prefix}.ffmpeg.stdout_done", started, seconds=seconds, bytes=total_bytes)
-        ffmpeg_stderr = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
-        ffmpeg_returncode = ffmpeg.wait()
-        timing_log(f"{log_prefix}.ffmpeg.exited", started, seconds=seconds, returncode=ffmpeg_returncode)
-        vibra_stdout = vibra.stdout.read()
-        vibra_stderr = vibra.stderr.read().decode("utf-8", errors="replace").strip()
-        vibra_returncode = vibra.wait()
-        timing_log(f"{log_prefix}.vibra.exited", started, seconds=seconds, returncode=vibra_returncode)
+        timing_log(f"{log_prefix}.ffmpeg.stdout_done", started, seconds=max_seconds, bytes=total_bytes)
+        state["ffmpeg_stderr"] = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
+        state["ffmpeg_returncode"] = ffmpeg.wait()
+        timing_log(f"{log_prefix}.ffmpeg.exited", started, seconds=max_seconds, returncode=state["ffmpeg_returncode"])
+        with condition:
+            state["done"] = True
+            condition.notify_all()
 
-        if ffmpeg_returncode != 0 and not capture_complete:
-            raise RuntimeError(ffmpeg_stderr or "ffmpeg failed")
-        if vibra_returncode != 0:
-            raise RuntimeError(vibra_stderr or "vibra failed")
-        data = parse_vibra_output(vibra_stdout)
-        timing_log(f"{log_prefix}.stream.done", started, seconds=seconds, found=bool(data.get("track")))
-        return data
+    reader = threading.Thread(target=read_stream, daemon=True)
+    reader.start()
+
+    try:
+        for mark in marks:
+            mark_bytes = math.ceil(mark * BYTES_PER_SECOND)
+            with condition:
+                while len(pcm_buffer) < mark_bytes and not state["done"] and not state["error"]:
+                    condition.wait(timeout=0.2)
+                if state["error"]:
+                    raise state["error"]
+                pcm = bytes(pcm_buffer[:mark_bytes])
+
+            if len(pcm) < mark_bytes:
+                break
+
+            timing_log(f"{log_prefix}.attempt.buffer_ready", started, seconds=mark, bytes=len(pcm))
+            data = recognize_pcm(pcm, mark)
+            timing_log(f"{log_prefix}.attempt.done", started, seconds=mark, found=bool(data.get("track")))
+            if data.get("track"):
+                timing_log(f"{log_prefix}.stream.done", started, seconds=mark, found=True)
+                return data, mark
+
+        reader.join(timeout=0.1)
+        if state["error"]:
+            raise state["error"]
+        if state["ffmpeg_returncode"] not in (None, 0) and not state["capture_complete"]:
+            raise RuntimeError(state["ffmpeg_stderr"] or "ffmpeg failed")
+        timing_log(f"{log_prefix}.stream.done", started, seconds=max_seconds, found=False)
+        return {}, max_seconds
     finally:
         terminate_process(ffmpeg)
-        terminate_process(vibra)
+        reader.join(timeout=1)
 
 
 def result_from_track(track, started, seconds, source, filename=""):
@@ -721,19 +814,14 @@ def recognize_track(selected_device=""):
         device = detect_device(selected_device)
         timing_log("system.detect_device.done", timing_started, device=device)
 
-        for mark in SYSTEM_ATTEMPT_MARKS:
-            attempt_started = time.monotonic()
-            timing_log("system.attempt.started", attempt_started, seconds=mark)
-            data = recognize_stream_from_device(device, mark)
-            track = data.get("track") or {}
-            result = result_from_track(track, started, mark, "system")
-            timing_log("system.attempt.done", attempt_started, seconds=mark, found=bool(result))
-
-            if result:
-                result["device"] = device
-                save_history(result)
-                timing_log("system.request.done", timing_started, found=True, seconds=mark)
-                return result
+        data, seconds = recognize_stream_attempts_from_device(device, SYSTEM_ATTEMPT_MARKS)
+        track = data.get("track") or {}
+        result = result_from_track(track, started, seconds, "system")
+        if result:
+            result["device"] = device
+            save_history(result)
+            timing_log("system.request.done", timing_started, found=True, seconds=seconds)
+            return result
 
         result = {
             "ok": True,
@@ -763,24 +851,19 @@ def recognize_microphone(selected_device=""):
         device = detect_microphone(selected_device)
         timing_log("microphone.detect_device.done", timing_started, device=device)
 
-        for mark in SYSTEM_ATTEMPT_MARKS:
-            attempt_started = time.monotonic()
-            timing_log("microphone.attempt.started", attempt_started, seconds=mark)
-            data = recognize_stream_from_device(
-                device,
-                mark,
-                silence_error=no_microphone_signal_error,
-                log_prefix="microphone",
-            )
-            track = data.get("track") or {}
-            result = result_from_track(track, started, mark, "microphone")
-            timing_log("microphone.attempt.done", attempt_started, seconds=mark, found=bool(result))
-
-            if result:
-                result["device"] = device
-                save_history(result)
-                timing_log("microphone.request.done", timing_started, found=True, seconds=mark)
-                return result
+        data, seconds = recognize_stream_attempts_from_device(
+            device,
+            SYSTEM_ATTEMPT_MARKS,
+            silence_error=no_microphone_signal_error,
+            log_prefix="microphone",
+        )
+        track = data.get("track") or {}
+        result = result_from_track(track, started, seconds, "microphone")
+        if result:
+            result["device"] = device
+            save_history(result)
+            timing_log("microphone.request.done", timing_started, found=True, seconds=seconds)
+            return result
 
         result = {
             "ok": True,
@@ -921,6 +1004,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/client-heartbeat":
+            query = urllib.parse.parse_qs(parsed.query)
+            client_id = (query.get("id") or [""])[0]
+            mark_client_seen(client_id)
+            self.send_json(200, {"ok": True})
+            return
+
+        if parsed.path == "/api/client-close":
+            query = urllib.parse.parse_qs(parsed.query)
+            client_id = (query.get("id") or [""])[0]
+            mark_client_closed(client_id)
+            self.send_json(200, {"ok": True})
+            return
+
         if parsed.path == "/api/clear-history":
             clear_history()
             self.send_json(200, {"ok": True, "items": []})
@@ -1004,6 +1101,8 @@ def make_server():
 
 
 def main():
+    global http_server
+
     if not IS_FROZEN and not ALLOW_SOURCE_RUN:
         print(
             "Music Search is intended to run from the packaged Linux artifact.\n"
@@ -1014,13 +1113,17 @@ def main():
         return 1
 
     server, port = make_server()
+    http_server = server
     if port == 0:
         port = server.server_address[1]
     url = f"http://{HOST}:{port}"
     print(f"Music Search running at {url}")
     if OPEN_BROWSER:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    if AUTO_SHUTDOWN:
+        threading.Thread(target=monitor_clients, daemon=True).start()
     server.serve_forever()
+    server.server_close()
     return 0
 
 

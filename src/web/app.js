@@ -58,6 +58,7 @@ const ERROR_MESSAGES = {
 };
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
 const DEVICE_REFRESH_MS = 2000;
+const CLIENT_HEARTBEAT_MS = 2000;
 const PLAY_ICON_PATH = "M8 5.8c0-.8.9-1.3 1.6-.9l8.2 5.2c.7.4.7 1.4 0 1.8l-8.2 5.2c-.7.4-1.6-.1-1.6-.9V5.8Z";
 const STOP_ICON_PATH = "M7.2 6.2c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2H8.4c-.7 0-1.2-.5-1.2-1.2V6.2Zm5.4 0c0-.7.5-1.2 1.2-1.2h1.8c.7 0 1.2.5 1.2 1.2v11.6c0 .7-.5 1.2-1.2 1.2h-1.8c-.7 0-1.2-.5-1.2-1.2V6.2Z";
 
@@ -71,6 +72,8 @@ let activeWaveformDrag = "";
 let playbackFrame = 0;
 let busyState = false;
 let busyMode = "";
+let heartbeatTimer = 0;
+const clientId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -115,6 +118,32 @@ async function readApiJson(response) {
   }
 
   return data;
+}
+
+function sendClientClose() {
+  const url = `/api/client-close?id=${encodeURIComponent(clientId)}`;
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(url, new Blob([], { type: "text/plain" }));
+    return;
+  }
+  fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
+function sendClientHeartbeat() {
+  fetch(`/api/client-heartbeat?id=${encodeURIComponent(clientId)}`, {
+    method: "POST",
+    cache: "no-store",
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function startClientHeartbeat() {
+  sendClientHeartbeat();
+  heartbeatTimer = window.setInterval(sendClientHeartbeat, CLIENT_HEARTBEAT_MS);
+  window.addEventListener("pagehide", () => {
+    window.clearInterval(heartbeatTimer);
+    sendClientClose();
+  });
 }
 
 function formatBytes(bytes) {
@@ -922,3 +951,4 @@ loadHistory().catch((error) => {
   historyEl.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
 });
 startDeviceRefresh();
+startClientHeartbeat();
