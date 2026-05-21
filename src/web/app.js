@@ -633,9 +633,13 @@ function renderResult(data) {
 
   const title = escapeHtml(data.title);
   const artist = escapeHtml(data.artist || "Unknown artist");
-  const link = data.href
-    ? `<a href="${escapeHtml(data.href)}" target="_blank" rel="noreferrer">Mở Shazam</a>`
+  const shazamLink = data.href
+    ? `<a href="${escapeHtml(data.href)}" target="_blank" rel="noreferrer">Shazam</a>`
     : "";
+  const youtubeLink = data.youtube_url
+    ? `<a href="${escapeHtml(data.youtube_url)}" target="_blank" rel="noreferrer">YouTube</a>`
+    : "";
+  const links = [shazamLink, youtubeLink].filter(Boolean).join(" · ");
 
   resultEl.innerHTML = `
     <div class="track-card">
@@ -643,7 +647,7 @@ function renderResult(data) {
       <div class="track-info">
         <span class="track-title">${title}</span>
         <p class="track-artist">${artist}</p>
-        <p class="track-meta">${escapeHtml(data.elapsed)}s ${link}</p>
+        <p class="track-meta">${escapeHtml(data.elapsed)}s ${links}</p>
       </div>
       <button class="icon-button js-copy-result" type="button">Copy</button>
     </div>
@@ -737,7 +741,7 @@ async function deleteHistoryItem(id) {
 async function recognize() {
   setBusy(true, "system");
   previewReset.classList.remove("is-hidden");
-  resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy...</p>`;
+  resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy, tối đa 5 giây...</p>`;
 
   try {
     const device = deviceSelect.value;
@@ -756,7 +760,7 @@ async function recognize() {
 async function recognizeMicrophone() {
   setBusy(true, "microphone");
   previewReset.classList.remove("is-hidden");
-  resultEl.innerHTML = `<p class="muted">Đang ghi âm từ microphone...</p>`;
+  resultEl.innerHTML = `<p class="muted">Đang ghi âm từ microphone, tối đa 5 giây...</p>`;
 
   try {
     const device = microphoneSelect.value;

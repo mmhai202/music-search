@@ -53,10 +53,13 @@ PORT_ENV = os.environ.get("PORT")
 PORT = int(PORT_ENV or "8765")
 OPEN_BROWSER = os.environ.get("OPEN_BROWSER", "1") != "0"
 DEBUG_TIMING = os.environ.get("MUSIC_SEARCH_DEBUG_TIMING") == "1"
+DEBUG_VIBRA_JSON = os.environ.get("MUSIC_SEARCH_DEBUG_VIBRA_JSON") == "1"
 AUTO_SHUTDOWN = os.environ.get("MUSIC_SEARCH_AUTO_SHUTDOWN", "1") != "0"
 CLIENT_HEARTBEAT_TIMEOUT = 8
 CLIENT_SHUTDOWN_GRACE = 2
-SYSTEM_ATTEMPT_MARKS = (3, 6)
+STREAM_RECOGNITION_LIMIT_SECONDS = 5
+STREAM_RECOGNITION_START_SECONDS = 1
+STREAM_RECOGNITION_INTERVAL_SECONDS = 1
 DEFAULT_UPLOAD_SECONDS = 10
 RATE = 44100
 CHANNELS = 1
@@ -545,9 +548,12 @@ def parse_vibra_output(raw):
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"vibra returned invalid JSON: {exc}") from exc
+    if DEBUG_VIBRA_JSON:
+        print(json.dumps(data, ensure_ascii=False, indent=2), file=sys.stderr)
+    return data
 
 
 def terminate_process(proc):
@@ -561,16 +567,25 @@ def terminate_process(proc):
         proc.wait()
 
 
-def recognize_stream_attempts_from_device(device, marks, silence_error=None, log_prefix="system"):
+def recognize_stream_until_match(
+    device,
+    limit_seconds,
+    start_seconds=STREAM_RECOGNITION_START_SECONDS,
+    interval_seconds=STREAM_RECOGNITION_INTERVAL_SECONDS,
+    silence_error=None,
+    log_prefix="system",
+):
     if silence_error is None:
         silence_error = no_audio_playing_error
 
-    marks = tuple(sorted(set(marks)))
-    if not marks:
+    limit_seconds = int(math.ceil(float(limit_seconds)))
+    start_seconds = min(int(math.ceil(float(start_seconds))), limit_seconds)
+    interval_seconds = max(1, int(math.ceil(float(interval_seconds))))
+    if limit_seconds <= 0:
         return {}, 0
 
     started = time.monotonic()
-    max_seconds = marks[-1]
+    max_seconds = limit_seconds
     ffmpeg_cmd = [
         executable_path("ffmpeg"),
         "-nostdin",
@@ -664,24 +679,44 @@ def recognize_stream_attempts_from_device(device, marks, silence_error=None, log
     reader.start()
 
     try:
-        for mark in marks:
-            mark_bytes = math.ceil(mark * BYTES_PER_SECOND)
+        next_attempt_seconds = start_seconds
+        attempted_seconds = set()
+        while True:
+            mark_bytes = math.ceil(next_attempt_seconds * BYTES_PER_SECOND)
             with condition:
                 while len(pcm_buffer) < mark_bytes and not state["done"] and not state["error"]:
                     condition.wait(timeout=0.2)
                 if state["error"]:
                     raise state["error"]
-                pcm = bytes(pcm_buffer[:mark_bytes])
+
+                available_seconds = min(max_seconds, len(pcm_buffer) // BYTES_PER_SECOND)
+                if available_seconds < next_attempt_seconds:
+                    break
+
+                attempt_seconds = available_seconds
+                if attempt_seconds in attempted_seconds:
+                    if attempt_seconds >= max_seconds:
+                        break
+                    next_attempt_seconds = min(max_seconds, next_attempt_seconds + interval_seconds)
+                    continue
+                attempted_seconds.add(attempt_seconds)
+                attempt_bytes = attempt_seconds * BYTES_PER_SECOND
+                pcm = bytes(pcm_buffer[:attempt_bytes])
 
             if len(pcm) < mark_bytes:
                 break
 
-            timing_log(f"{log_prefix}.attempt.buffer_ready", started, seconds=mark, bytes=len(pcm))
-            data = recognize_pcm(pcm, mark)
-            timing_log(f"{log_prefix}.attempt.done", started, seconds=mark, found=bool(data.get("track")))
+            seconds = attempt_seconds
+            timing_log(f"{log_prefix}.attempt.buffer_ready", started, seconds=seconds, bytes=len(pcm))
+            data = recognize_pcm(pcm, seconds)
+            timing_log(f"{log_prefix}.attempt.done", started, seconds=seconds, found=bool(data.get("track")))
             if data.get("track"):
-                timing_log(f"{log_prefix}.stream.done", started, seconds=mark, found=True)
-                return data, mark
+                timing_log(f"{log_prefix}.stream.done", started, seconds=seconds, found=True)
+                return data, seconds
+
+            if attempt_seconds >= max_seconds:
+                break
+            next_attempt_seconds = min(max_seconds, next_attempt_seconds + interval_seconds)
 
         reader.join(timeout=0.1)
         if state["error"]:
@@ -700,6 +735,7 @@ def result_from_track(track, started, seconds, source, filename=""):
     artist = track.get("subtitle") or ""
     href = ((track.get("share") or {}).get("href") or "")
     cover_url = first_image_url(track)
+    youtube_url = youtube_music_url(track, title, artist)
 
     if not title:
         return None
@@ -711,6 +747,7 @@ def result_from_track(track, started, seconds, source, filename=""):
         "title": title,
         "artist": artist,
         "href": href,
+        "youtube_url": youtube_url,
         "cover_url": cover_url,
         "source": source,
         "seconds": seconds,
@@ -721,6 +758,21 @@ def result_from_track(track, started, seconds, source, filename=""):
         result["filename"] = filename
     result["id"] = history_id(result)
     return result
+
+
+def youtube_music_url(track, title="", artist=""):
+    for provider in ((track.get("hub") or {}).get("providers") or []):
+        if provider.get("type") != "YOUTUBEMUSIC":
+            continue
+        for action in provider.get("actions") or []:
+            uri = action.get("uri") or ""
+            if uri:
+                return uri
+
+    query = " ".join(part for part in (title, artist) if part).strip()
+    if not query:
+        return ""
+    return f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query)}"
 
 
 def write_history(items):
@@ -814,7 +866,7 @@ def recognize_track(selected_device=""):
         device = detect_device(selected_device)
         timing_log("system.detect_device.done", timing_started, device=device)
 
-        data, seconds = recognize_stream_attempts_from_device(device, SYSTEM_ATTEMPT_MARKS)
+        data, seconds = recognize_stream_until_match(device, STREAM_RECOGNITION_LIMIT_SECONDS)
         track = data.get("track") or {}
         result = result_from_track(track, started, seconds, "system")
         if result:
@@ -851,9 +903,9 @@ def recognize_microphone(selected_device=""):
         device = detect_microphone(selected_device)
         timing_log("microphone.detect_device.done", timing_started, device=device)
 
-        data, seconds = recognize_stream_attempts_from_device(
+        data, seconds = recognize_stream_until_match(
             device,
-            SYSTEM_ATTEMPT_MARKS,
+            STREAM_RECOGNITION_LIMIT_SECONDS,
             silence_error=no_microphone_signal_error,
             log_prefix="microphone",
         )
