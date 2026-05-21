@@ -1,8 +1,8 @@
 # Music Search
 
-Ứng dụng web để nhận diện bài nhạc đang phát trên máy hoặc từ file audio upload.
+Ứng dụng web để nhận diện bài nhạc đang phát trên máy, từ microphone hoặc từ file audio upload.
 
-Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audio, dùng `vibra` để nhận diện bài hát, rồi hiển thị kết quả trên giao diện web.
+Dự án dùng `ffmpeg` để thu âm thanh hệ thống, thu microphone hoặc đọc file audio, dùng `vibra` để nhận diện bài hát, rồi hiển thị kết quả trên giao diện web.
 
 ![Giao diện Music Search](scripts/image.png)
 
@@ -10,6 +10,7 @@ Dự án dùng `ffmpeg` để thu âm thanh hệ thống hoặc đọc file audi
 
 - Nhận diện bài hát đang phát trên máy.
 - Chọn nguồn audio thủ công hoặc để Auto tự chọn nguồn đang phát.
+- Ghi âm từ microphone để nhận diện, có chọn microphone thủ công hoặc Auto.
 - Nhận diện bài hát từ file audio upload.
 - Có link mở kết quả trên Shazam.
 - Lưu lịch sử 10 bài gần nhất.
@@ -62,13 +63,13 @@ bash scripts/clean_ws.sh
 Artifact:
 
 ```text
-build_linux/dist/MusicSearch-0.2.1-x86_64.AppImage
+build_linux/dist/MusicSearch-0.3.1-x86_64.AppImage
 ```
 
 Chạy AppImage:
 
 ```bash
-./build_linux/dist/MusicSearch-0.2.1-x86_64.AppImage
+./build_linux/dist/MusicSearch-0.3.1-x86_64.AppImage
 ```
 
 Khi chạy, ứng dụng tự mở giao diện trong trình duyệt. AppImage đã bundle code Python, giao diện web, `ffmpeg`, `vibra`, `pactl`, desktop metadata và icon. Build artifact trên môi trường Linux tương thích với nền tảng phân phối.

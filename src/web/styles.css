@@ -219,6 +219,17 @@ h2 {
   animation: spin 1s linear infinite;
 }
 
+.mic-icon {
+  width: 30px;
+  height: 30px;
+  fill: currentColor;
+  flex: 0 0 auto;
+}
+
+.listen-button.is-listening .mic-icon {
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -450,6 +461,12 @@ h2 {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  50% {
+    transform: scale(1.08);
   }
 }
 

@@ -174,6 +174,22 @@ def no_audio_playing_error():
     )
 
 
+def no_microphone_signal_error():
+    return AppError(
+        "Không nghe thấy âm thanh từ micro. Kiểm tra quyền micro hoặc thử nói gần micro hơn.",
+        status=409,
+        code="no_microphone_signal",
+    )
+
+
+def microphone_not_found_error():
+    return AppError(
+        "Không tìm thấy microphone để thu âm.",
+        status=503,
+        code="microphone_not_found",
+    )
+
+
 def parse_sinks(pactl_output):
     sinks = []
     current = {}
@@ -218,7 +234,7 @@ def parse_sources(pactl_output):
     return sources
 
 
-def list_audio_devices():
+def list_audio_devices(kind="all"):
     listed_sources = run_text(["pactl", "list", "sources"])
     if listed_sources.returncode != 0:
         raise RuntimeError("Khong doc duoc pactl list sources")
@@ -240,22 +256,33 @@ def list_audio_devices():
             continue
         state = source.get("state") or ""
         is_monitor = name.endswith(".monitor")
+        device_kind = "monitor" if is_monitor else "input"
+        if kind != "all" and device_kind != kind:
+            continue
         devices.append(
             {
                 "id": name,
                 "label": source.get("description") or name,
                 "state": state,
                 "active": name in running_monitors if is_monitor else state == "RUNNING",
-                "kind": "monitor" if is_monitor else "input",
+                "kind": device_kind,
             }
         )
     return devices
 
 
+def list_system_audio_devices():
+    return list_audio_devices("monitor")
+
+
+def list_microphone_devices():
+    return list_audio_devices("input")
+
+
 def detect_device(selected_device=""):
     selected = selected_device.strip()
     if selected:
-        devices = list_audio_devices()
+        devices = list_system_audio_devices()
         selected_info = next((device for device in devices if device["id"] == selected), None)
         if not selected_info:
             raise AppError(
@@ -288,6 +315,47 @@ def detect_device(selected_device=""):
         status=503,
         code="audio_device_not_found",
     )
+
+
+def default_source_name():
+    listed_default = run_text(["pactl", "get-default-source"])
+    if listed_default.returncode != 0:
+        return ""
+    return listed_default.stdout.strip()
+
+
+def detect_microphone(selected_device=""):
+    selected = selected_device.strip()
+    devices = list_microphone_devices()
+
+    if selected:
+        selected_info = next((device for device in devices if device["id"] == selected), None)
+        if not selected_info:
+            raise AppError(
+                "Microphone đã chọn không còn khả dụng. Chọn Auto hoặc tải lại danh sách.",
+                status=404,
+                code="microphone_not_found",
+            )
+        return selected
+
+    forced = os.environ.get("MUSIC_SEARCH_MICROPHONE", "").strip()
+    if forced:
+        return forced
+
+    running = next((device for device in devices if device.get("active")), None)
+    if running:
+        return running["id"]
+
+    default_source = default_source_name()
+    if default_source:
+        default_device = next((device for device in devices if device["id"] == default_source), None)
+        if default_device:
+            return default_source
+
+    if devices:
+        return devices[0]["id"]
+
+    raise microphone_not_found_error()
 
 
 def capture_audio(device, seconds):
@@ -419,7 +487,10 @@ def terminate_process(proc):
         proc.wait()
 
 
-def recognize_stream_from_device(device, seconds):
+def recognize_stream_from_device(device, seconds, silence_error=None, log_prefix="system"):
+    if silence_error is None:
+        silence_error = no_audio_playing_error
+
     started = time.monotonic()
     ffmpeg_cmd = [
         executable_path("ffmpeg"),
@@ -457,7 +528,7 @@ def recognize_stream_from_device(device, seconds):
     ]
     ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     vibra = subprocess.Popen(vibra_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    timing_log("system.stream.started", started, seconds=seconds, device=device)
+    timing_log(f"{log_prefix}.stream.started", started, seconds=seconds, device=device)
     first_second = bytearray()
     signal_checked = False
     vibra_pipe_closed = False
@@ -482,13 +553,13 @@ def recognize_stream_from_device(device, seconds):
                     first_second.extend(feed_chunk[:need])
                 if len(first_second) >= BYTES_PER_SECOND:
                     signal_checked = True
-                    timing_log("system.signal_check.ready", started, seconds=seconds)
+                    timing_log(f"{log_prefix}.signal_check.ready", started, seconds=seconds)
                     if not pcm_has_signal(first_second):
-                        timing_log("system.signal_check.silent", started, seconds=seconds)
+                        timing_log(f"{log_prefix}.signal_check.silent", started, seconds=seconds)
                         terminate_process(ffmpeg)
                         terminate_process(vibra)
-                        raise no_audio_playing_error()
-                    timing_log("system.signal_check.ok", started, seconds=seconds)
+                        raise silence_error()
+                    timing_log(f"{log_prefix}.signal_check.ok", started, seconds=seconds)
 
             try:
                 vibra.stdin.write(feed_chunk)
@@ -500,31 +571,31 @@ def recognize_stream_from_device(device, seconds):
 
             if total_bytes >= target_bytes:
                 capture_complete = True
-                timing_log("system.ffmpeg.target_reached", started, seconds=seconds, bytes=total_bytes)
+                timing_log(f"{log_prefix}.ffmpeg.target_reached", started, seconds=seconds, bytes=total_bytes)
                 terminate_process(ffmpeg)
                 break
 
         if not signal_checked and not pcm_has_signal(first_second):
-            timing_log("system.signal_check.short_or_silent", started, seconds=seconds)
-            raise no_audio_playing_error()
+            timing_log(f"{log_prefix}.signal_check.short_or_silent", started, seconds=seconds)
+            raise silence_error()
 
         if vibra.stdin and not vibra_pipe_closed:
             vibra.stdin.close()
-        timing_log("system.ffmpeg.stdout_done", started, seconds=seconds, bytes=total_bytes)
+        timing_log(f"{log_prefix}.ffmpeg.stdout_done", started, seconds=seconds, bytes=total_bytes)
         ffmpeg_stderr = ffmpeg.stderr.read().decode("utf-8", errors="replace").strip()
         ffmpeg_returncode = ffmpeg.wait()
-        timing_log("system.ffmpeg.exited", started, seconds=seconds, returncode=ffmpeg_returncode)
+        timing_log(f"{log_prefix}.ffmpeg.exited", started, seconds=seconds, returncode=ffmpeg_returncode)
         vibra_stdout = vibra.stdout.read()
         vibra_stderr = vibra.stderr.read().decode("utf-8", errors="replace").strip()
         vibra_returncode = vibra.wait()
-        timing_log("system.vibra.exited", started, seconds=seconds, returncode=vibra_returncode)
+        timing_log(f"{log_prefix}.vibra.exited", started, seconds=seconds, returncode=vibra_returncode)
 
         if ffmpeg_returncode != 0 and not capture_complete:
             raise RuntimeError(ffmpeg_stderr or "ffmpeg failed")
         if vibra_returncode != 0:
             raise RuntimeError(vibra_stderr or "vibra failed")
         data = parse_vibra_output(vibra_stdout)
-        timing_log("system.stream.done", started, seconds=seconds, found=bool(data.get("track")))
+        timing_log(f"{log_prefix}.stream.done", started, seconds=seconds, found=bool(data.get("track")))
         return data
     finally:
         terminate_process(ffmpeg)
@@ -677,6 +748,54 @@ def recognize_track(selected_device=""):
         recognize_lock.release()
 
 
+def recognize_microphone(selected_device=""):
+    if not recognize_lock.acquire(blocking=False):
+        raise AppError(
+            "Đang có lượt nhận diện khác chạy. Chờ lượt hiện tại kết thúc rồi thử lại.",
+            status=409,
+            code="recognition_busy",
+        )
+
+    try:
+        started = time.time()
+        timing_started = time.monotonic()
+        timing_log("microphone.request.started", timing_started, selected=bool(selected_device))
+        device = detect_microphone(selected_device)
+        timing_log("microphone.detect_device.done", timing_started, device=device)
+
+        for mark in SYSTEM_ATTEMPT_MARKS:
+            attempt_started = time.monotonic()
+            timing_log("microphone.attempt.started", attempt_started, seconds=mark)
+            data = recognize_stream_from_device(
+                device,
+                mark,
+                silence_error=no_microphone_signal_error,
+                log_prefix="microphone",
+            )
+            track = data.get("track") or {}
+            result = result_from_track(track, started, mark, "microphone")
+            timing_log("microphone.attempt.done", attempt_started, seconds=mark, found=bool(result))
+
+            if result:
+                result["device"] = device
+                save_history(result)
+                timing_log("microphone.request.done", timing_started, found=True, seconds=mark)
+                return result
+
+        result = {
+            "ok": True,
+            "found": False,
+            "source": "microphone",
+            "device": device,
+            "elapsed": round(time.time() - started, 2),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        timing_log("microphone.request.done", timing_started, found=False)
+        return result
+    finally:
+        recognize_lock.release()
+
+
 def recognize_uploaded_file(audio_bytes, filename="", start_seconds=0, end_seconds=0):
     if not recognize_lock.acquire(blocking=False):
         raise AppError(
@@ -758,7 +877,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/devices":
             try:
-                self.send_json(200, {"devices": list_audio_devices()})
+                self.send_json(200, {"devices": list_system_audio_devices()})
+            except Exception as exc:
+                self.send_error_json(exc)
+            return
+
+        if parsed.path == "/api/microphones":
+            try:
+                self.send_json(200, {"devices": list_microphone_devices()})
             except Exception as exc:
                 self.send_error_json(exc)
             return
@@ -844,16 +970,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error_json(exc)
             return
 
-        if parsed.path != "/api/recognize":
-            self.send_error(404)
+        if parsed.path == "/api/recognize-mic":
+            query = urllib.parse.parse_qs(parsed.query)
+            selected_device = (query.get("device") or [""])[0]
+            try:
+                self.send_json(200, recognize_microphone(selected_device))
+            except Exception as exc:
+                self.send_error_json(exc)
             return
 
-        query = urllib.parse.parse_qs(parsed.query)
-        selected_device = (query.get("device") or [""])[0]
-        try:
-            self.send_json(200, recognize_track(selected_device))
-        except Exception as exc:
-            self.send_error_json(exc)
+        if parsed.path == "/api/recognize":
+            query = urllib.parse.parse_qs(parsed.query)
+            selected_device = (query.get("device") or [""])[0]
+            try:
+                self.send_json(200, recognize_track(selected_device))
+            except Exception as exc:
+                self.send_error_json(exc)
+            return
+
+        self.send_error(404)
 
 
 def make_server():

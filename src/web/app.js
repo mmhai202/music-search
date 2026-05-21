@@ -2,6 +2,10 @@ const listenButton = document.querySelector("#listenButton");
 const buttonText = document.querySelector("#buttonText");
 const deviceSelect = document.querySelector("#deviceSelect");
 const selectedDeviceText = document.querySelector("#selectedDeviceText");
+const microphoneButton = document.querySelector("#microphoneButton");
+const microphoneButtonText = document.querySelector("#microphoneButtonText");
+const microphoneSelect = document.querySelector("#microphoneSelect");
+const selectedMicrophoneText = document.querySelector("#selectedMicrophoneText");
 const audioFile = document.querySelector("#audioFile");
 const fileName = document.querySelector("#fileName");
 const uploadButton = document.querySelector("#uploadButton");
@@ -49,6 +53,8 @@ const ERROR_MESSAGES = {
   no_audio_stream: "Không tìm thấy audio trong file.",
   missing_dependency: "Thiếu ffmpeg hoặc vibra. Kiểm tra thư mục bin cạnh ứng dụng.",
   audio_device_not_found: "Không tìm thấy thiết bị audio để thu âm.",
+  microphone_not_found: "Không tìm thấy microphone để thu âm.",
+  no_microphone_signal: "Không nghe thấy âm thanh từ micro. Kiểm tra quyền micro hoặc thử nói gần micro hơn.",
 };
 const INITIAL_RESULT_HTML = `<p class="muted">Bấm nút để nghe audio hệ thống, hoặc chọn file audio để nhận diện.</p>`;
 const DEVICE_REFRESH_MS = 2000;
@@ -64,6 +70,7 @@ let waveformPeaks = [];
 let activeWaveformDrag = "";
 let playbackFrame = 0;
 let busyState = false;
+let busyMode = "";
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -150,23 +157,28 @@ function validateSelectedFile(file) {
   return null;
 }
 
-function setBusy(isBusy) {
+function setBusy(isBusy, mode = "") {
   busyState = isBusy;
+  busyMode = isBusy ? mode : "";
   listenButton.disabled = busyState;
   deviceSelect.disabled = busyState;
+  microphoneButton.disabled = busyState;
+  microphoneSelect.disabled = busyState;
   uploadButton.disabled = busyState;
   audioFile.disabled = busyState;
   previewPlay.disabled = busyState || !audioFile.files?.[0];
   previewReset.disabled = busyState;
   waveformBox.classList.toggle("is-disabled", busyState || !audioFile.files?.[0]);
-  listenButton.classList.toggle("is-listening", busyState);
-  buttonText.textContent = busyState ? "Đang nghe..." : "Tìm bài đang phát";
-  uploadButtonText.textContent = busyState ? "Đang tìm..." : "Tìm kiếm";
+  listenButton.classList.toggle("is-listening", busyState && busyMode === "system");
+  microphoneButton.classList.toggle("is-listening", busyState && busyMode === "microphone");
+  buttonText.textContent = busyState && busyMode === "system" ? "Đang nghe..." : "Tìm bài đang phát";
+  microphoneButtonText.textContent = busyState && busyMode === "microphone" ? "Đang ghi..." : "Ghi âm và tìm bài";
+  uploadButtonText.textContent = busyState && busyMode === "upload" ? "Đang tìm..." : "Tìm kiếm";
 }
 
-function deviceLabel(device) {
+function deviceLabel(device, activeText = "đang phát") {
   const label = device.label || device.id || "Audio device";
-  return device.active ? `${label} (đang phát)` : label;
+  return device.active ? `${label} (${activeText})` : label;
 }
 
 function updateSelectedDeviceText() {
@@ -174,20 +186,33 @@ function updateSelectedDeviceText() {
   selectedDeviceText.textContent = selectedOption?.textContent || "Auto";
 }
 
-function renderDevices(devices) {
-  const selected = deviceSelect.value;
-  deviceSelect.innerHTML = `<option value="">Auto</option>`;
+function updateSelectedMicrophoneText() {
+  const selectedOption = microphoneSelect.options[microphoneSelect.selectedIndex];
+  selectedMicrophoneText.textContent = selectedOption?.textContent || "Auto";
+}
+
+function renderDeviceOptions(selectEl, devices, updateLabel, activeText = "đang phát") {
+  const selected = selectEl.value;
+  selectEl.innerHTML = `<option value="">Auto</option>`;
   for (const device of devices) {
     const option = document.createElement("option");
     option.value = device.id || "";
-    option.textContent = deviceLabel(device);
-    deviceSelect.appendChild(option);
+    option.textContent = deviceLabel(device, activeText);
+    selectEl.appendChild(option);
   }
 
   if (selected && devices.some((device) => device.id === selected)) {
-    deviceSelect.value = selected;
+    selectEl.value = selected;
   }
-  updateSelectedDeviceText();
+  updateLabel();
+}
+
+function renderDevices(devices) {
+  renderDeviceOptions(deviceSelect, devices, updateSelectedDeviceText);
+}
+
+function renderMicrophones(devices) {
+  renderDeviceOptions(microphoneSelect, devices, updateSelectedMicrophoneText, "đang thu");
 }
 
 async function loadDevices() {
@@ -212,15 +237,43 @@ async function loadDevices() {
   }
 }
 
+async function loadMicrophones() {
+  if (busyState) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/microphones?t=${Date.now()}`, { cache: "no-store" });
+    const data = await readApiJson(response);
+    if (!data.ok && data.error) {
+      throw new Error(userErrorMessage(data));
+    }
+    renderMicrophones(data.devices || []);
+  } catch (error) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Auto";
+    microphoneSelect.innerHTML = "";
+    microphoneSelect.appendChild(option);
+    updateSelectedMicrophoneText();
+  }
+}
+
 function startDeviceRefresh() {
   loadDevices();
+  loadMicrophones();
   setInterval(() => {
     loadDevices();
+    loadMicrophones();
   }, DEVICE_REFRESH_MS);
-  window.addEventListener("focus", loadDevices);
+  window.addEventListener("focus", () => {
+    loadDevices();
+    loadMicrophones();
+  });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       loadDevices();
+      loadMicrophones();
     }
   });
 }
@@ -653,7 +706,7 @@ async function deleteHistoryItem(id) {
 }
 
 async function recognize() {
-  setBusy(true);
+  setBusy(true, "system");
   previewReset.classList.remove("is-hidden");
   resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy...</p>`;
 
@@ -661,6 +714,25 @@ async function recognize() {
     const device = deviceSelect.value;
     const query = device ? `?device=${encodeURIComponent(device)}` : "";
     const response = await fetch(`/api/recognize${query}`, { method: "POST" });
+    const data = await readApiJson(response);
+    renderResult(data);
+    await loadHistory();
+  } catch (error) {
+    renderResult({ ok: false, error: error.message });
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function recognizeMicrophone() {
+  setBusy(true, "microphone");
+  previewReset.classList.remove("is-hidden");
+  resultEl.innerHTML = `<p class="muted">Đang ghi âm từ microphone...</p>`;
+
+  try {
+    const device = microphoneSelect.value;
+    const query = device ? `?device=${encodeURIComponent(device)}` : "";
+    const response = await fetch(`/api/recognize-mic${query}`, { method: "POST" });
     const data = await readApiJson(response);
     renderResult(data);
     await loadHistory();
@@ -684,7 +756,7 @@ async function recognizeFile() {
     return;
   }
 
-  setBusy(true);
+  setBusy(true, "upload");
   previewReset.classList.remove("is-hidden");
   const startSeconds = selectedStartSeconds();
   const endSeconds = selectedEndSeconds();
@@ -713,6 +785,8 @@ async function recognizeFile() {
 
 listenButton.addEventListener("click", recognize);
 deviceSelect.addEventListener("change", updateSelectedDeviceText);
+microphoneButton.addEventListener("click", recognizeMicrophone);
+microphoneSelect.addEventListener("change", updateSelectedMicrophoneText);
 uploadButton.addEventListener("click", recognizeFile);
 audioFile.addEventListener("change", () => {
   const file = audioFile.files?.[0];
