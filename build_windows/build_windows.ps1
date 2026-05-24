@@ -26,13 +26,17 @@ Set-Location $ProjectRoot
 if ($Clean) {
   Remove-Item -Recurse -Force (Join-Path $BuildRoot "build") -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $Dist -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $Venv -ErrorAction SilentlyContinue
 }
 
 if (-not (Test-Path $Venv)) {
-  py -3 -m venv $Venv
+  $HostPython = (Get-Command python -ErrorAction Stop).Source
+  Write-Host "Creating venv with $HostPython"
+  & $HostPython -m venv $Venv
 }
 
 $Python = Join-Path $Venv "Scripts\python.exe"
+& $Python --version
 & $Python -m pip install --upgrade pip
 & $Python -m pip install -r (Join-Path $ProjectRoot "requirements-build.txt") -r (Join-Path $ProjectRoot "requirements-windows.txt")
 
