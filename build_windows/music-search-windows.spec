@@ -3,6 +3,8 @@ from pathlib import Path
 import os
 import shutil
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 build_root = Path(SPECPATH).resolve()
 root = build_root.parent
@@ -22,7 +24,7 @@ def add_binary(name):
         binaries.append((str(source), "bin"))
 
 
-for binary_name in ("ffmpeg", "vibra", "pactl"):
+for binary_name in ("ffmpeg.exe", "vibra.exe"):
     add_binary(binary_name)
 
 
@@ -31,7 +33,7 @@ a = Analysis(
     pathex=[str(src_root)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=collect_submodules("soundcard"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -44,20 +46,27 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name=artifact_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name=artifact_name,
 )

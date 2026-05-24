@@ -17,15 +17,21 @@ Dự án dùng `ffmpeg` để thu âm thanh hệ thống, thu microphone hoặc 
 
 ## Build prerequisites
 
-Dự án dùng cho Linux có PulseAudio/PipeWire Pulse.
+Dự án hỗ trợ build artifact cho Linux và Windows. Linux dùng PulseAudio/PipeWire Pulse. Windows dùng WASAPI loopback qua `SoundCard`.
 
-Môi trường build cần có:
+Môi trường build Linux cần có:
 
 - Python 3
 - `ffmpeg`
 - `pactl`
 - `vibra`
 - `appimagetool`
+
+Môi trường build Windows cần có:
+
+- Python 3
+- `ffmpeg.exe`
+- `vibra.exe`
 
 ## Chuẩn bị
 
@@ -44,7 +50,7 @@ bash scripts/install_deps.sh
 
 Script này sẽ cài các gói hệ thống cần thiết, cài `appimagetool` nếu máy build chưa có, và build `vibra`.
 
-Source runtime nằm trong `src/`. Thư mục `build_linux/` chứa cấu hình build AppImage.
+Source runtime nằm trong `src/`. Version release nằm tại `VERSION`. Thư mục `build_linux/` chứa cấu hình build AppImage. Thư mục `build_windows/` chứa cấu hình build portable ZIP.
 
 ## Build Linux
 
@@ -79,3 +85,32 @@ Runtime data như lịch sử nhận diện được lưu theo XDG state, mặc 
 ```text
 ~/.local/state/music-search/history.jsonl
 ```
+
+## Build Windows
+
+Tạo release artifact portable ZIP trên Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_windows/build_windows.ps1 -Clean
+```
+
+Artifact:
+
+```text
+build_windows/dist/MusicSearch-0.3.1-windows-x86_64.zip
+```
+
+Giải nén ZIP và chạy `MusicSearch.exe`. Runtime data mặc định lưu tại:
+
+```text
+%LOCALAPPDATA%\MusicSearch\history.jsonl
+```
+
+## Build CI
+
+Luồng build chính thức nằm trong GitHub Actions:
+
+- `ubuntu-22.04`: build Linux AppImage.
+- `windows-2022`: build Windows portable ZIP.
+
+Mỗi job chạy smoke test `/api/health`, `/`, `/app.js`, `/styles.css` và `/api/history` trước khi upload artifact.

@@ -741,7 +741,7 @@ async function deleteHistoryItem(id) {
 async function recognize() {
   setBusy(true, "system");
   previewReset.classList.remove("is-hidden");
-  resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy, tối đa 5 giây...</p>`;
+  resultEl.innerHTML = `<p class="muted">Đang nghe audio từ máy...</p>`;
 
   try {
     const device = deviceSelect.value;
@@ -760,7 +760,7 @@ async function recognize() {
 async function recognizeMicrophone() {
   setBusy(true, "microphone");
   previewReset.classList.remove("is-hidden");
-  resultEl.innerHTML = `<p class="muted">Đang ghi âm từ microphone, tối đa 5 giây...</p>`;
+  resultEl.innerHTML = `<p class="muted">Đang ghi âm từ microphone...</p>`;
 
   try {
     const device = microphoneSelect.value;

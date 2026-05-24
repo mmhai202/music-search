@@ -1,0 +1,149 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  VIBRA_REPO: https://github.com/BayernMuller/vibra.git
+  VIBRA_REF: 5ff95ed1654894631517de1acb5c765bb4fb6c83
+  SMOKE_PORT: "9876"
+
+jobs:
+  linux:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Linux build dependencies
+        run: bash scripts/install_deps.sh
+
+      - name: Build AppImage
+        run: bash build_linux/build_linux.sh --clean
+
+      - name: Smoke test AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(find build_linux/dist -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$app"
+          chmod +x "$app"
+          OPEN_BROWSER=0 MUSIC_SEARCH_AUTO_SHUTDOWN=0 PORT="$SMOKE_PORT" APPIMAGE_EXTRACT_AND_RUN=1 "$app" &
+          pid="$!"
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in {1..40}; do
+            if curl -fsS "http://127.0.0.1:$SMOKE_PORT/api/health"; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS "http://127.0.0.1:$SMOKE_PORT/" >/dev/null
+          curl -fsS "http://127.0.0.1:$SMOKE_PORT/app.js" >/dev/null
+          curl -fsS "http://127.0.0.1:$SMOKE_PORT/styles.css" >/dev/null
+          curl -fsS "http://127.0.0.1:$SMOKE_PORT/api/history" >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: music-search-linux
+          path: build_linux/dist/*.AppImage
+
+  windows:
+    name: Windows ZIP
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Build vibra
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $VibraDir = Join-Path $env:RUNNER_TEMP "vibra"
+          $BuildDir = Join-Path $env:RUNNER_TEMP "vibra-build"
+          git clone $env:VIBRA_REPO $VibraDir
+          git -C $VibraDir checkout --detach $env:VIBRA_REF
+
+          $VcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $VcpkgRoot) {
+            $VcpkgRoot = "C:\vcpkg"
+          }
+          & "$VcpkgRoot\vcpkg.exe" install curl:x64-windows-static fftw3:x64-windows-static
+
+          cmake -S $VibraDir -B $BuildDir `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$VcpkgRoot\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build $BuildDir --config Release --parallel
+
+          New-Item -ItemType Directory -Force bin | Out-Null
+          $VibraExe = Get-ChildItem $BuildDir -Recurse -Filter vibra.exe | Select-Object -First 1
+          if (-not $VibraExe) {
+            throw "vibra.exe was not produced"
+          }
+          Copy-Item $VibraExe.FullName bin\vibra.exe -Force
+
+          $FfmpegExe = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if ($FfmpegExe) {
+            $FfmpegPath = $FfmpegExe.FullName
+          } else {
+            $FfmpegPath = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
+          }
+          Copy-Item $FfmpegPath bin\ffmpeg.exe -Force
+
+      - name: Build Windows ZIP
+        shell: pwsh
+        run: .\build_windows\build_windows.ps1 -Clean
+
+      - name: Smoke test Windows package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $AppDir = "build_windows\build\pyinstaller-dist\MusicSearch"
+          if (-not (Test-Path "$AppDir\MusicSearch.exe")) { throw "Missing MusicSearch.exe" }
+          if (-not (Test-Path "$AppDir\_internal\bin\ffmpeg.exe")) { throw "Missing bundled ffmpeg.exe" }
+          if (-not (Test-Path "$AppDir\_internal\bin\vibra.exe")) { throw "Missing bundled vibra.exe" }
+
+          $env:OPEN_BROWSER = "0"
+          $env:MUSIC_SEARCH_AUTO_SHUTDOWN = "0"
+          $env:PORT = $env:SMOKE_PORT
+          $Process = Start-Process -FilePath "$AppDir\MusicSearch.exe" -PassThru
+          try {
+            $Healthy = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              try {
+                Invoke-RestMethod "http://127.0.0.1:$env:SMOKE_PORT/api/health" | Out-Null
+                $Healthy = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $Healthy) {
+              throw "App did not become healthy"
+            }
+            Invoke-WebRequest "http://127.0.0.1:$env:SMOKE_PORT/" -UseBasicParsing | Out-Null
+            Invoke-WebRequest "http://127.0.0.1:$env:SMOKE_PORT/app.js" -UseBasicParsing | Out-Null
+            Invoke-WebRequest "http://127.0.0.1:$env:SMOKE_PORT/styles.css" -UseBasicParsing | Out-Null
+            Invoke-RestMethod "http://127.0.0.1:$env:SMOKE_PORT/api/history" | Out-Null
+          } finally {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: music-search-windows
+          path: build_windows/dist/*.zip

@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import webbrowser
 
 APP_NAME = "Music Search"
 APP_ID = "music-search"
+WINDOWS_APP_DIR = "MusicSearch"
 IS_FROZEN = getattr(sys, "frozen", False)
 ALLOW_SOURCE_RUN = os.environ.get("MUSIC_SEARCH_ALLOW_SOURCE_RUN") == "1"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -26,6 +28,7 @@ PUBLIC = RESOURCE_ROOT / "web"
 def app_version():
     candidates = [
         RESOURCE_ROOT / "VERSION",
+        Path(__file__).resolve().parents[1] / "VERSION",
         Path(__file__).resolve().parents[1] / "build_linux" / "VERSION",
     ]
     for candidate in candidates:
@@ -35,10 +38,34 @@ def app_version():
 
 
 APP_VERSION = app_version()
-ARTIFACT_NAME = f"MusicSearch-{APP_VERSION}-{os.uname().machine}.AppImage"
 
 
-def app_state_dir():
+def is_windows_platform(platform_name=None):
+    return (platform_name or sys.platform).lower().startswith("win")
+
+
+def artifact_name(platform_name=None, machine=None):
+    platform_name = platform_name or sys.platform
+    machine = machine or platform.machine() or "unknown"
+    if is_windows_platform(platform_name):
+        return f"MusicSearch-{APP_VERSION}-windows-{machine}.zip"
+    return f"MusicSearch-{APP_VERSION}-{machine}.AppImage"
+
+
+ARTIFACT_NAME = artifact_name()
+
+
+def app_state_dir(platform_name=None):
+    override = os.environ.get("MUSIC_SEARCH_STATE_DIR")
+    if override:
+        return Path(override)
+
+    if is_windows_platform(platform_name):
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / WINDOWS_APP_DIR
+        return Path.home() / "AppData" / "Local" / WINDOWS_APP_DIR
+
     base = os.environ.get("XDG_STATE_HOME")
     if base:
         return Path(base) / APP_ID
@@ -193,18 +220,23 @@ def normalize_history_item(item):
 
 
 def executable_path(name):
+    names = [name]
+    if is_windows_platform() and not name.lower().endswith(".exe"):
+        names.append(f"{name}.exe")
+
     candidates = [
-        RESOURCE_ROOT / "bin" / name,
-        RUNTIME_ROOT / "bin" / name,
-        Path(__file__).resolve().parent / "bin" / name,
+        root / "bin" / candidate_name
+        for candidate_name in names
+        for root in (RESOURCE_ROOT, RUNTIME_ROOT, Path(__file__).resolve().parent)
     ]
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
 
-    found = shutil.which(name)
-    if found:
-        return found
+    for candidate_name in names:
+        found = shutil.which(candidate_name)
+        if found:
+            return found
     raise AppError(
         f"Không tìm thấy {name}. Hãy đặt file này trong thư mục bin cạnh ứng dụng.",
         status=503,
@@ -311,7 +343,7 @@ def parse_sources(pactl_output):
     return sources
 
 
-def list_audio_devices(kind="all"):
+def list_linux_audio_devices(kind="all"):
     listed_sources = run_text(["pactl", "list", "sources"])
     if listed_sources.returncode != 0:
         raise RuntimeError("Khong doc duoc pactl list sources")
@@ -348,6 +380,83 @@ def list_audio_devices(kind="all"):
     return devices
 
 
+def load_soundcard():
+    try:
+        import soundcard as sc
+    except ImportError as exc:
+        raise AppError(
+            "Thiếu thư viện SoundCard để thu âm trên Windows.",
+            status=503,
+            code="missing_dependency",
+        ) from exc
+    return sc
+
+
+def soundcard_device_id(device):
+    value = getattr(device, "id", None)
+    if value is None or value == "":
+        value = getattr(device, "name", "")
+    return str(value)
+
+
+def soundcard_device_label(device):
+    return str(getattr(device, "name", "") or soundcard_device_id(device))
+
+
+def list_windows_system_audio_devices():
+    sc = load_soundcard()
+    try:
+        default_id = soundcard_device_id(sc.default_speaker())
+    except Exception:
+        default_id = ""
+
+    devices = []
+    for speaker in sc.all_speakers():
+        device_id = soundcard_device_id(speaker)
+        devices.append(
+            {
+                "id": device_id,
+                "label": soundcard_device_label(speaker),
+                "state": "AVAILABLE",
+                "active": device_id == default_id if default_id else False,
+                "kind": "monitor",
+            }
+        )
+    return devices
+
+
+def list_windows_microphone_devices():
+    sc = load_soundcard()
+    try:
+        default_id = soundcard_device_id(sc.default_microphone())
+    except Exception:
+        default_id = ""
+
+    devices = []
+    for microphone in sc.all_microphones(include_loopback=False):
+        device_id = soundcard_device_id(microphone)
+        devices.append(
+            {
+                "id": device_id,
+                "label": soundcard_device_label(microphone),
+                "state": "AVAILABLE",
+                "active": device_id == default_id if default_id else False,
+                "kind": "input",
+            }
+        )
+    return devices
+
+
+def list_audio_devices(kind="all"):
+    if is_windows_platform():
+        if kind == "monitor":
+            return list_windows_system_audio_devices()
+        if kind == "input":
+            return list_windows_microphone_devices()
+        return list_windows_system_audio_devices() + list_windows_microphone_devices()
+    return list_linux_audio_devices(kind)
+
+
 def list_system_audio_devices():
     return list_audio_devices("monitor")
 
@@ -357,6 +466,9 @@ def list_microphone_devices():
 
 
 def detect_device(selected_device=""):
+    if is_windows_platform():
+        return detect_windows_device(selected_device)
+
     selected = selected_device.strip()
     if selected:
         devices = list_system_audio_devices()
@@ -394,6 +506,37 @@ def detect_device(selected_device=""):
     )
 
 
+def detect_windows_device(selected_device=""):
+    selected = selected_device.strip()
+    if selected:
+        devices = list_windows_system_audio_devices()
+        selected_info = next((device for device in devices if device["id"] == selected), None)
+        if not selected_info:
+            raise AppError(
+                "Thiết bị audio đã chọn không còn khả dụng. Chọn Auto hoặc tải lại danh sách.",
+                status=404,
+                code="audio_device_not_found",
+            )
+        return selected
+
+    forced = os.environ.get("VIBRA_DEVICE", "").strip()
+    if forced:
+        return forced
+
+    sc = load_soundcard()
+    try:
+        return soundcard_device_id(sc.default_speaker())
+    except Exception as exc:
+        devices = list_windows_system_audio_devices()
+        if devices:
+            return devices[0]["id"]
+        raise AppError(
+            "Không tìm thấy thiết bị audio để thu âm.",
+            status=503,
+            code="audio_device_not_found",
+        ) from exc
+
+
 def default_source_name():
     listed_default = run_text(["pactl", "get-default-source"])
     if listed_default.returncode != 0:
@@ -402,6 +545,9 @@ def default_source_name():
 
 
 def detect_microphone(selected_device=""):
+    if is_windows_platform():
+        return detect_windows_microphone(selected_device)
+
     selected = selected_device.strip()
     devices = list_microphone_devices()
 
@@ -432,6 +578,33 @@ def detect_microphone(selected_device=""):
     if devices:
         return devices[0]["id"]
 
+    raise microphone_not_found_error()
+
+
+def detect_windows_microphone(selected_device=""):
+    selected = selected_device.strip()
+    if selected:
+        devices = list_windows_microphone_devices()
+        selected_info = next((device for device in devices if device["id"] == selected), None)
+        if not selected_info:
+            raise AppError(
+                "Microphone đã chọn không còn khả dụng. Chọn Auto hoặc tải lại danh sách.",
+                status=404,
+                code="microphone_not_found",
+            )
+        return selected
+
+    forced = os.environ.get("MUSIC_SEARCH_MICROPHONE", "").strip()
+    if forced:
+        return forced
+
+    sc = load_soundcard()
+    try:
+        return soundcard_device_id(sc.default_microphone())
+    except Exception:
+        devices = list_windows_microphone_devices()
+        if devices:
+            return devices[0]["id"]
     raise microphone_not_found_error()
 
 
@@ -475,6 +648,122 @@ def pcm_has_signal(pcm):
         if abs(sample) > PCM_SIGNAL_THRESHOLD:
             return True
     return False
+
+
+def pcm_slice(pcm, seconds):
+    return pcm[: int(math.ceil(seconds * BYTES_PER_SECOND))]
+
+
+def float_audio_to_s32le(audio):
+    if hasattr(audio, "ndim") and hasattr(audio, "astype"):
+        import numpy
+
+        samples = audio
+        if getattr(samples, "ndim", 0) > 1:
+            samples = samples.mean(axis=1)
+        samples = numpy.clip(samples, -1.0, 1.0)
+        return (samples * 2147483647).astype("<i4").tobytes()
+
+    pcm = bytearray()
+    for frame in audio:
+        if isinstance(frame, (list, tuple)):
+            if frame:
+                value = sum(float(sample) for sample in frame) / len(frame)
+            else:
+                value = 0.0
+        else:
+            value = float(frame)
+        value = max(-1.0, min(1.0, value))
+        sample = int(value * 2147483647)
+        pcm.extend(sample.to_bytes(4, byteorder="little", signed=True))
+    return bytes(pcm)
+
+
+def resolve_soundcard_microphone(device_id, loopback=False):
+    sc = load_soundcard()
+    candidates = [device_id]
+    if loopback:
+        for speaker in sc.all_speakers():
+            if soundcard_device_id(speaker) == device_id:
+                candidates.append(soundcard_device_label(speaker))
+                break
+        try:
+            default_speaker = sc.default_speaker()
+            candidates.append(soundcard_device_id(default_speaker))
+            candidates.append(soundcard_device_label(default_speaker))
+        except Exception:
+            pass
+
+    last_error = None
+    for candidate in [candidate for candidate in candidates if candidate]:
+        try:
+            return sc.get_microphone(candidate, include_loopback=loopback)
+        except Exception as exc:
+            last_error = exc
+
+    if loopback:
+        for microphone in sc.all_microphones(include_loopback=True):
+            if getattr(microphone, "isloopback", False):
+                return microphone
+        raise AppError(
+            "Không tìm thấy thiết bị audio để thu âm.",
+            status=503,
+            code="audio_device_not_found",
+        ) from last_error
+
+    try:
+        return sc.default_microphone()
+    except Exception as exc:
+        last_error = last_error or exc
+    raise microphone_not_found_error() from last_error
+
+
+def record_windows_pcm(device_id, seconds, loopback=False):
+    seconds = int(math.ceil(float(seconds)))
+    frames = seconds * RATE
+    microphone = resolve_soundcard_microphone(device_id, loopback=loopback)
+    audio = microphone.record(numframes=frames, samplerate=RATE)
+    return float_audio_to_s32le(audio)
+
+
+def recognize_windows_stream_until_match(
+    device,
+    limit_seconds,
+    start_seconds=STREAM_RECOGNITION_START_SECONDS,
+    interval_seconds=STREAM_RECOGNITION_INTERVAL_SECONDS,
+    silence_error=None,
+    log_prefix="system",
+):
+    if silence_error is None:
+        silence_error = no_audio_playing_error
+
+    limit_seconds = int(math.ceil(float(limit_seconds)))
+    start_seconds = min(int(math.ceil(float(start_seconds))), limit_seconds)
+    interval_seconds = max(1, int(math.ceil(float(interval_seconds))))
+    if limit_seconds <= 0:
+        return {}, 0
+
+    started = time.monotonic()
+    pcm = record_windows_pcm(device, limit_seconds, loopback=log_prefix == "system")
+    timing_log(f"{log_prefix}.soundcard.capture.done", started, seconds=limit_seconds, bytes=len(pcm))
+    if not pcm_has_signal(pcm_slice(pcm, min(1, limit_seconds))):
+        raise silence_error()
+
+    attempted_seconds = set()
+    seconds = start_seconds
+    while seconds <= limit_seconds:
+        attempt_seconds = min(limit_seconds, seconds)
+        if attempt_seconds in attempted_seconds:
+            break
+        attempted_seconds.add(attempt_seconds)
+        attempt_pcm = pcm_slice(pcm, attempt_seconds)
+        data = recognize_pcm(attempt_pcm, attempt_seconds)
+        timing_log(f"{log_prefix}.attempt.done", started, seconds=attempt_seconds, found=bool(data.get("track")))
+        if data.get("track"):
+            return data, attempt_seconds
+        seconds += interval_seconds
+
+    return {}, limit_seconds
 
 
 def decode_audio_file(audio_bytes, seconds, start_seconds=0):
@@ -575,6 +864,16 @@ def recognize_stream_until_match(
     silence_error=None,
     log_prefix="system",
 ):
+    if is_windows_platform():
+        return recognize_windows_stream_until_match(
+            device,
+            limit_seconds,
+            start_seconds=start_seconds,
+            interval_seconds=interval_seconds,
+            silence_error=silence_error,
+            log_prefix=log_prefix,
+        )
+
     if silence_error is None:
         silence_error = no_audio_playing_error
 
@@ -1006,6 +1305,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/health":
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "version": APP_VERSION,
+                    "platform": platform.system() or sys.platform,
+                    "frozen": IS_FROZEN,
+                },
+            )
+            return
+
         if parsed.path == "/api/history":
             self.send_json(200, {"items": load_history()})
             return
@@ -1157,9 +1468,11 @@ def main():
 
     if not IS_FROZEN and not ALLOW_SOURCE_RUN:
         print(
-            "Music Search is intended to run from the packaged Linux artifact.\n"
-            "Build it with: bash build_linux/build_linux.sh --clean\n"
-            f"Then run: ./build_linux/dist/{ARTIFACT_NAME}",
+            "Music Search is intended to run from a packaged artifact.\n"
+            "For local development set MUSIC_SEARCH_ALLOW_SOURCE_RUN=1.\n"
+            "Build Linux with: bash build_linux/build_linux.sh --clean\n"
+            "Build Windows with: powershell -ExecutionPolicy Bypass -File build_windows/build_windows.ps1 -Clean\n"
+            f"Expected artifact name: {ARTIFACT_NAME}",
             file=sys.stderr,
         )
         return 1

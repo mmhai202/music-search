@@ -37,8 +37,12 @@ dist/
 build_linux/.venv/
 build_linux/build/
 build_linux/dist/
+build_windows/.venv/
+build_windows/build/
+build_windows/dist/
 squashfs-root/
 *.AppImage
+*.zip
 
 # OS files
 .DS_Store

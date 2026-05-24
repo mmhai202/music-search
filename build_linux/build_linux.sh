@@ -5,7 +5,7 @@ BUILD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$BUILD_ROOT/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-VERSION="$(tr -d '[:space:]' < "$BUILD_ROOT/VERSION")"
+VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/VERSION")"
 ARCH="$(uname -m)"
 INTERNAL_BINARY="MusicSearch"
 APPIMAGE_NAME="MusicSearch-${VERSION}-${ARCH}.AppImage"
@@ -29,7 +29,7 @@ if [ ! -d "$BUILD_ROOT/.venv" ]; then
 fi
 
 "$BUILD_ROOT/.venv/bin/python" -m pip install --upgrade pip
-"$BUILD_ROOT/.venv/bin/python" -m pip install -r "$BUILD_ROOT/requirements-dev.txt"
+"$BUILD_ROOT/.venv/bin/python" -m pip install -r "$PROJECT_ROOT/requirements-build.txt"
 
 for binary in ffmpeg vibra pactl; do
   if ! command -v "$binary" >/dev/null 2>&1 && [ ! -x "bin/$binary" ]; then

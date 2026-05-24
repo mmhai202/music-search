@@ -21,7 +21,7 @@ install_main_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     run_as_root apt-get update
     run_as_root apt-get install -y \
-      ffmpeg jq pulseaudio-utils git cmake g++ make wget \
+      ffmpeg jq pulseaudio-utils git cmake g++ make wget python3-venv \
       libcurl4-openssl-dev libfftw3-dev
   elif command -v dnf >/dev/null 2>&1; then
     run_as_root dnf install -y \
