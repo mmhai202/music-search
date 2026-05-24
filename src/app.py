@@ -244,9 +244,25 @@ def executable_path(name):
     )
 
 
+def hidden_subprocess_kwargs():
+    if is_windows_platform() and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def run_hidden(args, **kwargs):
+    kwargs.update(hidden_subprocess_kwargs())
+    return subprocess.run(args, **kwargs)
+
+
+def popen_hidden(args, **kwargs):
+    kwargs.update(hidden_subprocess_kwargs())
+    return subprocess.Popen(args, **kwargs)
+
+
 def run_text(args):
     resolved = [executable_path(args[0]), *args[1:]]
-    return subprocess.run(resolved, text=True, capture_output=True, check=False)
+    return run_hidden(resolved, text=True, capture_output=True, check=False)
 
 
 def user_error_message(error):
@@ -403,20 +419,64 @@ def soundcard_device_label(device):
     return str(getattr(device, "name", "") or soundcard_device_id(device))
 
 
+def normalized_soundcard_name(value):
+    return str(value or "").strip().casefold()
+
+
+def soundcard_devices_match(first, second):
+    first_values = {
+        normalized_soundcard_name(soundcard_device_id(first)),
+        normalized_soundcard_name(soundcard_device_label(first)),
+    }
+    second_values = {
+        normalized_soundcard_name(soundcard_device_id(second)),
+        normalized_soundcard_name(soundcard_device_label(second)),
+    }
+    first_values.discard("")
+    second_values.discard("")
+    if first_values & second_values:
+        return True
+    return any(first in second or second in first for first in first_values for second in second_values)
+
+
+def windows_loopback_microphones(sc):
+    return [
+        microphone
+        for microphone in sc.all_microphones(include_loopback=True)
+        if getattr(microphone, "isloopback", False)
+    ]
+
+
+def default_windows_loopback_microphone(sc):
+    loopbacks = windows_loopback_microphones(sc)
+    if not loopbacks:
+        return None
+
+    try:
+        default_speaker = sc.default_speaker()
+    except Exception:
+        default_speaker = None
+
+    if default_speaker is not None:
+        for microphone in loopbacks:
+            if soundcard_devices_match(default_speaker, microphone):
+                return microphone
+
+    return loopbacks[0]
+
+
 def list_windows_system_audio_devices():
     sc = load_soundcard()
-    try:
-        default_id = soundcard_device_id(sc.default_speaker())
-    except Exception:
-        default_id = ""
+    default_loopback = default_windows_loopback_microphone(sc)
+    default_id = soundcard_device_id(default_loopback) if default_loopback else ""
 
     devices = []
-    for speaker in sc.all_speakers():
-        device_id = soundcard_device_id(speaker)
+    for microphone in windows_loopback_microphones(sc):
+        device_id = soundcard_device_id(microphone)
         devices.append(
             {
                 "id": device_id,
-                "label": soundcard_device_label(speaker),
+                "label": soundcard_device_label(microphone),
                 "state": "AVAILABLE",
                 "active": device_id == default_id if default_id else False,
                 "kind": "monitor",
@@ -524,17 +584,14 @@ def detect_windows_device(selected_device=""):
         return forced
 
     sc = load_soundcard()
-    try:
-        return soundcard_device_id(sc.default_speaker())
-    except Exception as exc:
-        devices = list_windows_system_audio_devices()
-        if devices:
-            return devices[0]["id"]
-        raise AppError(
-            "Không tìm thấy thiết bị audio để thu âm.",
-            status=503,
-            code="audio_device_not_found",
-        ) from exc
+    microphone = default_windows_loopback_microphone(sc)
+    if microphone is not None:
+        return soundcard_device_id(microphone)
+    raise AppError(
+        "Không tìm thấy thiết bị audio để thu âm.",
+        status=503,
+        code="audio_device_not_found",
+    )
 
 
 def default_source_name():
@@ -628,7 +685,7 @@ def capture_audio(device, seconds):
         "s32le",
         "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = run_hidden(cmd, capture_output=True, check=False)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(err or "ffmpeg failed")
@@ -683,14 +740,23 @@ def resolve_soundcard_microphone(device_id, loopback=False):
     sc = load_soundcard()
     candidates = [device_id]
     if loopback:
-        for speaker in sc.all_speakers():
-            if soundcard_device_id(speaker) == device_id:
-                candidates.append(soundcard_device_label(speaker))
-                break
+        loopbacks = windows_loopback_microphones(sc)
+        selected = normalized_soundcard_name(device_id)
+        for microphone in loopbacks:
+            microphone_values = {
+                normalized_soundcard_name(soundcard_device_id(microphone)),
+                normalized_soundcard_name(soundcard_device_label(microphone)),
+            }
+            if selected and selected in microphone_values:
+                return microphone
+
         try:
             default_speaker = sc.default_speaker()
-            candidates.append(soundcard_device_id(default_speaker))
-            candidates.append(soundcard_device_label(default_speaker))
+            for microphone in loopbacks:
+                if soundcard_devices_match(default_speaker, microphone):
+                    candidates.append(soundcard_device_id(microphone))
+                    candidates.append(soundcard_device_label(microphone))
+                    break
         except Exception:
             pass
 
@@ -702,9 +768,9 @@ def resolve_soundcard_microphone(device_id, loopback=False):
             last_error = exc
 
     if loopback:
-        for microphone in sc.all_microphones(include_loopback=True):
-            if getattr(microphone, "isloopback", False):
-                return microphone
+        microphone = default_windows_loopback_microphone(sc)
+        if microphone is not None:
+            return microphone
         raise AppError(
             "Không tìm thấy thiết bị audio để thu âm.",
             status=503,
@@ -787,7 +853,7 @@ def decode_audio_file(audio_bytes, seconds, start_seconds=0):
         "s32le",
         "-",
     ]
-    proc = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=False)
+    proc = run_hidden(cmd, input=audio_bytes, capture_output=True, check=False)
     timing_log(
         "upload.ffmpeg.decode.done",
         started,
@@ -823,7 +889,7 @@ def recognize_pcm(pcm, seconds):
         "--bits",
         str(BITS),
     ]
-    proc = subprocess.run(cmd, input=pcm, capture_output=True, check=False)
+    proc = run_hidden(cmd, input=pcm, capture_output=True, check=False)
     timing_log("vibra.recognize.done", started, seconds=seconds, bytes=len(pcm), returncode=proc.returncode)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
@@ -907,7 +973,7 @@ def recognize_stream_until_match(
         "s32le",
         "-",
     ]
-    ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ffmpeg = popen_hidden(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     timing_log(f"{log_prefix}.stream.started", started, seconds=max_seconds, device=device)
     condition = threading.Condition()
     pcm_buffer = bytearray()

@@ -22,6 +22,36 @@ class Completed:
         self.returncode = returncode
 
 
+class FakeSoundcardDevice:
+    def __init__(self, device_id, name, isloopback=False):
+        self.id = device_id
+        self.name = name
+        self.isloopback = isloopback
+
+
+class FakeSoundcard:
+    def __init__(self):
+        self.speaker = FakeSoundcardDevice("speaker-1", "Speakers")
+        self.loopback = FakeSoundcardDevice("speaker-1-loopback", "Speakers loopback", True)
+        self.other_loopback = FakeSoundcardDevice("speaker-2-loopback", "HDMI loopback", True)
+        self.microphone = FakeSoundcardDevice("mic-1", "Microphone")
+
+    def default_speaker(self):
+        return self.speaker
+
+    def all_microphones(self, include_loopback=False):
+        if include_loopback:
+            return [self.microphone, self.loopback, self.other_loopback]
+        return [self.microphone]
+
+    def get_microphone(self, device_id, include_loopback=False):
+        devices = self.all_microphones(include_loopback=include_loopback)
+        for device in devices:
+            if device.id == device_id or device.name == device_id:
+                return device
+        raise RuntimeError(device_id)
+
+
 class AppTests(unittest.TestCase):
     def test_parse_pactl_devices_and_active_monitor(self):
         sinks = """Sink #1
@@ -83,6 +113,48 @@ Source #2
         loud = (app.PCM_SIGNAL_THRESHOLD + 1).to_bytes(4, "little", signed=True)
         self.assertFalse(app.pcm_has_signal(silent))
         self.assertTrue(app.pcm_has_signal(loud))
+
+    def test_hidden_subprocess_kwargs_hide_windows_console(self):
+        flag = 0x08000000
+        with mock.patch.object(app, "is_windows_platform", return_value=True), mock.patch.object(
+            app.subprocess, "CREATE_NO_WINDOW", flag, create=True
+        ):
+            self.assertEqual(app.hidden_subprocess_kwargs(), {"creationflags": flag})
+
+    def test_run_hidden_applies_windows_console_flag(self):
+        flag = 0x08000000
+        with mock.patch.object(app, "is_windows_platform", return_value=True), mock.patch.object(
+            app.subprocess, "CREATE_NO_WINDOW", flag, create=True
+        ), mock.patch.object(app.subprocess, "run", return_value=Completed()) as mocked_run:
+            app.run_hidden(["tool"], capture_output=True, check=False)
+
+        mocked_run.assert_called_once_with(
+            ["tool"],
+            capture_output=True,
+            check=False,
+            creationflags=flag,
+        )
+
+    def test_windows_system_devices_are_loopback_capture_devices(self):
+        fake_sc = FakeSoundcard()
+        with mock.patch.object(app, "load_soundcard", return_value=fake_sc):
+            devices = app.list_windows_system_audio_devices()
+
+        self.assertEqual([device["id"] for device in devices], ["speaker-1-loopback", "speaker-2-loopback"])
+        self.assertTrue(devices[0]["active"])
+        self.assertEqual(devices[0]["kind"], "monitor")
+
+    def test_detect_windows_device_auto_uses_default_loopback(self):
+        fake_sc = FakeSoundcard()
+        with mock.patch.object(app, "load_soundcard", return_value=fake_sc), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app.detect_windows_device(), "speaker-1-loopback")
+
+    def test_resolve_loopback_returns_selected_loopback_device(self):
+        fake_sc = FakeSoundcard()
+        with mock.patch.object(app, "load_soundcard", return_value=fake_sc):
+            resolved = app.resolve_soundcard_microphone("speaker-2-loopback", loopback=True)
+
+        self.assertIs(resolved, fake_sc.other_loopback)
 
     def test_history_roundtrip_respects_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
